@@ -6,6 +6,9 @@
     - Trakt:
         - icon: trakt.svg
           href: https://app.trakt.tv/
+    - Letterboxd:
+        - icon: mdi-movie-star
+          href: https://letterboxd.com
 
 - APIs:
     - TMDb:

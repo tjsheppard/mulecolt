@@ -128,8 +128,8 @@ services:
       - PGID=${PGID}
     volumes:
       - ${APPS}:/srv/apps
-      - ${APPS}/filebrowser/data:/config
-      - ${APPS}/filebrowser/config/settings.json:/config/settings.json
+      - ${APPS}/filebrowser/data/database:/database
+      - ${APPS}/filebrowser/config/settings.json:/.filebrowser.json
       - ${MEDIA}:/srv/media
     ports:
       - 8080:80
