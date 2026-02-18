@@ -53,6 +53,21 @@ migrate(
                     type: "bool",
                     required: false,
                 },
+                {
+                    name: "hash",
+                    type: "text",
+                    required: false,
+                },
+                {
+                    name: "rd_id",
+                    type: "text",
+                    required: false,
+                },
+                {
+                    name: "repair_attempts",
+                    type: "number",
+                    required: false,
+                },
             ],
             indexes: [
                 "CREATE UNIQUE INDEX idx_torrents_path ON torrents (path)",
@@ -165,7 +180,7 @@ migrate(
             system: false,
             listRule: "",
             viewRule: "",
-            viewQuery: "SELECT id, name, path, score, archived, manual FROM torrents WHERE archived = 1",
+            viewQuery: "SELECT id, name, path, score, archived, manual, hash, rd_id, repair_attempts FROM torrents WHERE archived = 1",
         });
         app.save(archivedView);
 
@@ -178,7 +193,7 @@ migrate(
             system: false,
             listRule: "",
             viewRule: "",
-            viewQuery: "SELECT id, name, path, score, archived, manual FROM torrents WHERE manual = 1",
+            viewQuery: "SELECT id, name, path, score, archived, manual, hash, rd_id, repair_attempts FROM torrents WHERE manual = 1",
         });
         app.save(manualView);
 

@@ -25,6 +25,8 @@ from pathlib import Path
 import requests
 from guessit import guessit
 
+from tmdb_utils import match_file_to_tmdb_episode, tmdb_get_show_structure
+
 # Re-use organiser config
 ZURG_MOUNT = Path("/zurg")
 POCKETBASE_URL = os.environ.get("POCKETBASE_URL", "http://pocketbase:8090")
@@ -314,23 +316,74 @@ def resolve_as_show(pb: PBClient, torrent: dict, tmdb_info: dict):
 
     torrent_root = Path(torrent.get("path", ""))
 
+    # Fetch TMDB structure for season/episode matching
+    tmdb_structure = tmdb_get_show_structure(tmdb_id, TMDB_API_KEY, TMDB_BASE)
+    if tmdb_structure:
+        season_summary = ", ".join(
+            f"S{s:02d}×{tmdb_structure.episodes_in_season(s)}"
+            for s in tmdb_structure.season_numbers
+        )
+        print(f"  TMDB structure: {tmdb_structure.total_episodes} episodes ({season_summary})")
+
     episodes_found = 0
     for vf in video_files:
         fg = guessit(vf.name, {"type": "episode"})
-        season = fg.get("season")
-        episode = fg.get("episode")
+        guessit_season = fg.get("season")
+        guessit_episode = fg.get("episode")
 
         # Try parent directory for season (e.g. /Season 2/03) Foo.mkv)
-        if season is None:
+        if guessit_season is None:
             try:
                 rel = vf.relative_to(torrent_root)
                 for part in rel.parts[:-1]:
                     m = _SEASON_DIR_PATTERN.search(part)
                     if m:
-                        season = int(m.group(1))
+                        guessit_season = int(m.group(1))
                         break
             except ValueError:
                 pass
+
+        # --- Primary: TMDB structure matching ---
+        matched_episodes: list[tuple[int, int]] | None = None
+        if tmdb_structure:
+            matched_episodes = match_file_to_tmdb_episode(
+                vf.name, guessit_season, guessit_episode, tmdb_structure,
+            )
+
+        if matched_episodes:
+            for season, ep_num in matched_episodes:
+                episodes_found += 1
+                existing = pb.get_show_episode(tmdb_id, season, ep_num)
+
+                if existing:
+                    existing_torrent_id = existing.get("torrent")
+                    if not existing_torrent_id:
+                        pb.update_show(existing["id"], torrent=torrent_id)
+                        print(f"  Re-linked: {title} S{season:02d}E{ep_num:02d}")
+                        continue
+
+                    existing_torrent = (existing.get("expand") or {}).get("torrent")
+                    if not existing_torrent:
+                        existing_torrent = pb.get_torrent_by_id(existing_torrent_id)
+                    existing_score = existing_torrent.get("score", 0) if existing_torrent else 0
+
+                    if torrent_score > existing_score:
+                        pb.update_show(existing["id"], torrent=torrent_id)
+                        print(f"  {title} S{season:02d}E{ep_num:02d} — new torrent wins ({torrent_score} > {existing_score})")
+                    else:
+                        print(f"  {title} S{season:02d}E{ep_num:02d} — existing wins ({existing_score} >= {torrent_score})")
+                else:
+                    pb.create_show(
+                        torrent_id=torrent_id, tmdb_id=tmdb_id,
+                        title=title, year=year,
+                        season=season, episode=ep_num,
+                    )
+                    print(f"  Created: {title} S{season:02d}E{ep_num:02d}")
+            continue  # TMDB match handled
+
+        # --- Fallback: guessit-only assignment ---
+        season = guessit_season
+        episode = guessit_episode
 
         # Default to season 1
         if season is None:
@@ -349,7 +402,7 @@ def resolve_as_show(pb: PBClient, torrent: dict, tmdb_info: dict):
                 existing_torrent_id = existing.get("torrent")
                 if not existing_torrent_id:
                     pb.update_show(existing["id"], torrent=torrent_id)
-                    print(f"  Re-linked: {title} S{season:02d}E{ep_num:02d}")
+                    print(f"  Re-linked: {title} S{season:02d}E{ep_num:02d} (fallback)")
                     continue
 
                 existing_torrent = (existing.get("expand") or {}).get("torrent")
@@ -359,16 +412,16 @@ def resolve_as_show(pb: PBClient, torrent: dict, tmdb_info: dict):
 
                 if torrent_score > existing_score:
                     pb.update_show(existing["id"], torrent=torrent_id)
-                    print(f"  {title} S{season:02d}E{ep_num:02d} — new torrent wins ({torrent_score} > {existing_score})")
+                    print(f"  {title} S{season:02d}E{ep_num:02d} — new torrent wins ({torrent_score} > {existing_score}) (fallback)")
                 else:
-                    print(f"  {title} S{season:02d}E{ep_num:02d} — existing wins ({existing_score} >= {torrent_score})")
+                    print(f"  {title} S{season:02d}E{ep_num:02d} — existing wins ({existing_score} >= {torrent_score}) (fallback)")
             else:
                 pb.create_show(
                     torrent_id=torrent_id, tmdb_id=tmdb_id,
                     title=title, year=year,
                     season=season, episode=ep_num,
                 )
-                print(f"  Created: {title} S{season:02d}E{ep_num:02d}")
+                print(f"  Created: {title} S{season:02d}E{ep_num:02d} (fallback)")
 
     if episodes_found == 0:
         print("  WARNING: No episodes could be parsed from the video files")

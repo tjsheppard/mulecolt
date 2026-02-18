@@ -31,6 +31,10 @@ services:
       - TMDB_API_KEY=${TMDB_API_KEY:-}
       - SCAN_INTERVAL_SECS=${SCAN_INTERVAL_SECS:-300}
       - POCKETBASE_URL=http://pocketbase:8090
+      - REAL_DEBRID_API_KEY=${REAL_DEBRID_API_KEY:-}
+      - REPAIR_ENABLED=${REPAIR_ENABLED:-true}
+      - MAX_REPAIR_ATTEMPTS=${MAX_REPAIR_ATTEMPTS:-3}
+      - MIN_VIDEO_FILE_SIZE_MB=${MIN_VIDEO_FILE_SIZE_MB:-100}
     volumes:
       - ${APPS}/rclone/config/rclone.conf:/rclone/rclone.conf:ro
       - ${MEDIA}:/media
@@ -126,10 +130,12 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
     volumes:
+      - ${APPS}/filebrowser/data/root:/srv
       - ${APPS}:/srv/apps
       - ${APPS}/filebrowser/data/database:/database
       - ${APPS}/filebrowser/config/settings.json:/.filebrowser.json
       - ${MEDIA}:/srv/media
+      - ${APPS}/filebrowser/data/config:/config
     ports:
       - 8080:80
 

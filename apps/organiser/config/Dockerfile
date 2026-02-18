@@ -16,6 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY organiser.py .
 COPY resolve.py .
+COPY tmdb_utils.py .
+COPY rd_api.py .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
