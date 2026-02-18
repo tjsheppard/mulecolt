@@ -652,8 +652,9 @@ def tmdb_search_film(title: str, year: int | None = None,
             scored = [
                 (r, _score_tmdb_result(title, r, year,
                                        name_key="title",
-                                       date_key="release_date"))
-                for r in results
+                                       date_key="release_date",
+                                       search_rank=i))
+                for i, r in enumerate(results)
             ]
             scored.sort(key=lambda x: x[1], reverse=True)
             r = scored[0][0]
@@ -676,11 +677,19 @@ def tmdb_search_film(title: str, year: int | None = None,
 def _score_tmdb_result(query_title: str, result: dict,
                        query_year: int | None,
                        name_key: str = "name",
-                       date_key: str = "first_air_date") -> float:
+                       date_key: str = "first_air_date",
+                       search_rank: int = 0) -> float:
     """Score a single TMDB result against the query title/year.
 
     Higher score = better match.  Uses word overlap between the query and
     the result's name/original_name, plus year proximity if available.
+
+    *search_rank* is the 0-based position in TMDB's own search results.
+    A small descending bonus is added so that, when the scoring function
+    cannot differentiate results (e.g. non-Latin query words that don't
+    appear in the English name or original_name fields), TMDB's own
+    relevance ordering — which considers alternative titles, translations,
+    etc. — acts as a tiebreaker.
     """
     def _words(text: str) -> set[str]:
         return set(re.findall(r'[a-z0-9]+', text.lower()))
@@ -730,7 +739,12 @@ def _score_tmdb_result(query_title: str, result: dict,
     popularity = result.get("popularity", 0)
     pop_score = min(popularity / 1000, 0.05)
 
-    return title_score + year_score + pop_score
+    # TMDB search-rank bonus — preserves TMDB's own relevance ordering as
+    # a tiebreaker.  Decays with position so only the top few results get
+    # a meaningful boost (max 0.04 for rank 0, 0 at rank 20+).
+    rank_bonus = max(0.0, 0.04 - search_rank * 0.002)
+
+    return title_score + year_score + pop_score + rank_bonus
 
 
 def tmdb_search_tv(title: str, year: int | None = None,
@@ -767,8 +781,9 @@ def tmdb_search_tv(title: str, year: int | None = None,
             scored = [
                 (r, _score_tmdb_result(title, r, year,
                                        name_key="name",
-                                       date_key="first_air_date"))
-                for r in results
+                                       date_key="first_air_date",
+                                       search_rank=i))
+                for i, r in enumerate(results)
             ]
             scored.sort(key=lambda x: x[1], reverse=True)
             r = scored[0][0]
