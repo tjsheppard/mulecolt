@@ -1,6 +1,6 @@
 /// <reference path="../pb_data/types.d.ts" />
 
-// PocketBase migration: create tmdb, films, and shows collections.
+// PocketBase migration: create torrents, films, and shows collections.
 // This runs automatically on first boot (clean slate — no upgrade path).
 
 migrate(
@@ -16,10 +16,10 @@ migrate(
         }
 
         // ---------------------------------------------------------------
-        // Collection: tmdb — canonical TMDB records (deduped by tmdb_id + type)
+        // Collection: torrents — one record per torrent from Real-Debrid
         // ---------------------------------------------------------------
-        const tmdb = new Collection({
-            name: "tmdb",
+        const torrents = new Collection({
+            name: "torrents",
             type: "base",
             system: false,
             listRule: "",
@@ -29,15 +29,62 @@ migrate(
             deleteRule: "",
             fields: [
                 {
-                    name: "tmdb_id",
-                    type: "number",
+                    name: "name",
+                    type: "text",
                     required: true,
                 },
                 {
-                    name: "type",
-                    type: "select",
+                    name: "path",
+                    type: "text",
                     required: true,
-                    values: ["film", "show"],
+                },
+                {
+                    name: "score",
+                    type: "number",
+                    required: false,
+                },
+                {
+                    name: "archived",
+                    type: "bool",
+                    required: false,
+                },
+                {
+                    name: "manual",
+                    type: "bool",
+                    required: false,
+                },
+            ],
+            indexes: [
+                "CREATE UNIQUE INDEX idx_torrents_path ON torrents (path)",
+            ],
+        });
+        app.save(torrents);
+
+        // ---------------------------------------------------------------
+        // Collection: films — one record per unique TMDB film identity
+        // ---------------------------------------------------------------
+        const films = new Collection({
+            name: "films",
+            type: "base",
+            system: false,
+            listRule: "",
+            viewRule: "",
+            createRule: "",
+            updateRule: "",
+            deleteRule: "",
+            fields: [
+                {
+                    name: "torrent",
+                    type: "relation",
+                    required: false,
+                    collectionId: torrents.id,
+                    cascadeDelete: false,
+                    maxSelect: 1,
+                },
+                {
+                    name: "tmdb_id",
+                    type: "number",
+                    required: true,
                 },
                 {
                     name: "title",
@@ -51,56 +98,13 @@ migrate(
                 },
             ],
             indexes: [
-                "CREATE UNIQUE INDEX idx_tmdb_key ON tmdb (tmdb_id, type)",
-            ],
-        });
-        app.save(tmdb);
-
-        // ---------------------------------------------------------------
-        // Collection: films — source→target mappings for films
-        // ---------------------------------------------------------------
-        const films = new Collection({
-            name: "films",
-            type: "base",
-            system: false,
-            listRule: "",
-            viewRule: "",
-            createRule: "",
-            updateRule: "",
-            deleteRule: "",
-            fields: [
-                {
-                    name: "source_path",
-                    type: "text",
-                    required: true,
-                },
-                {
-                    name: "target_path",
-                    type: "text",
-                    required: true,
-                },
-                {
-                    name: "tmdb",
-                    type: "relation",
-                    required: true,
-                    collectionId: tmdb.id,
-                    cascadeDelete: false,
-                    maxSelect: 1,
-                },
-                {
-                    name: "score",
-                    type: "number",
-                    required: false,
-                },
-            ],
-            indexes: [
-                "CREATE UNIQUE INDEX idx_films_source ON films (source_path)",
+                "CREATE UNIQUE INDEX idx_films_tmdb ON films (tmdb_id)",
             ],
         });
         app.save(films);
 
         // ---------------------------------------------------------------
-        // Collection: shows — source→target mappings for TV episodes
+        // Collection: shows — one record per unique episode identity
         // ---------------------------------------------------------------
         const shows = new Collection({
             name: "shows",
@@ -113,43 +117,100 @@ migrate(
             deleteRule: "",
             fields: [
                 {
-                    name: "source_path",
-                    type: "text",
-                    required: true,
-                },
-                {
-                    name: "target_path",
-                    type: "text",
-                    required: true,
-                },
-                {
-                    name: "tmdb",
+                    name: "torrent",
                     type: "relation",
-                    required: true,
-                    collectionId: tmdb.id,
+                    required: false,
+                    collectionId: torrents.id,
                     cascadeDelete: false,
                     maxSelect: 1,
                 },
                 {
-                    name: "season",
+                    name: "tmdb_id",
+                    type: "number",
+                    required: true,
+                },
+                {
+                    name: "title",
+                    type: "text",
+                    required: true,
+                },
+                {
+                    name: "year",
                     type: "number",
                     required: false,
                 },
                 {
+                    name: "season",
+                    type: "number",
+                    required: true,
+                },
+                {
                     name: "episode",
                     type: "number",
-                    required: false,
+                    required: true,
                 },
             ],
             indexes: [
-                "CREATE UNIQUE INDEX idx_shows_source ON shows (source_path)",
+                "CREATE UNIQUE INDEX idx_shows_episode ON shows (tmdb_id, season, episode)",
             ],
         });
         app.save(shows);
+
+        // ---------------------------------------------------------------
+        // View: archived_torrents — torrents with archived = true
+        // ---------------------------------------------------------------
+        const archivedView = new Collection({
+            name: "archived_torrents",
+            type: "view",
+            system: false,
+            listRule: "",
+            viewRule: "",
+            viewQuery: "SELECT id, name, path, score, archived, manual FROM torrents WHERE archived = 1",
+        });
+        app.save(archivedView);
+
+        // ---------------------------------------------------------------
+        // View: manual_torrents — torrents with manual = true
+        // ---------------------------------------------------------------
+        const manualView = new Collection({
+            name: "manual_torrents",
+            type: "view",
+            system: false,
+            listRule: "",
+            viewRule: "",
+            viewQuery: "SELECT id, name, path, score, archived, manual FROM torrents WHERE manual = 1",
+        });
+        app.save(manualView);
+
+        // ---------------------------------------------------------------
+        // View: unique_shows — one row per distinct show (by tmdb_id)
+        // ---------------------------------------------------------------
+        const uniqueShowsView = new Collection({
+            name: "unique_shows",
+            type: "view",
+            system: false,
+            listRule: "",
+            viewRule: "",
+            viewQuery: "SELECT MIN(id) as id, tmdb_id, title, year, COUNT(DISTINCT season) as season_count, COUNT(*) as episode_count FROM shows GROUP BY tmdb_id, title, year",
+        });
+        app.save(uniqueShowsView);
+
+        // ---------------------------------------------------------------
+        // View: show_seasons — one row per show + season combination
+        // ---------------------------------------------------------------
+        const showSeasonsView = new Collection({
+            name: "show_seasons",
+            type: "view",
+            system: false,
+            listRule: "",
+            viewRule: "",
+            viewQuery: "SELECT MIN(id) as id, tmdb_id, title, year, season, COUNT(*) as episode_count FROM shows GROUP BY tmdb_id, title, year, season",
+        });
+        app.save(showSeasonsView);
     },
     (app) => {
         // Rollback
-        for (const name of ["shows", "films", "tmdb"]) {
+        for (const name of ["show_seasons", "unique_shows", "manual_torrents", "archived_torrents", "shows", "films", "torrents"]) {
             try {
                 const col = app.findCollectionByNameOrId(name);
                 app.delete(col);

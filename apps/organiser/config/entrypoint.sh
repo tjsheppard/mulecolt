@@ -2,7 +2,7 @@
 set -e
 
 echo "Starting rclone mount..."
-rclone mount zurg: /zurg \
+rclone mount zurg:__all__/ /zurg \
     --config /rclone/rclone.conf \
     --allow-other \
     --allow-non-empty \

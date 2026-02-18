@@ -31,7 +31,6 @@ services:
       - TMDB_API_KEY=${TMDB_API_KEY:-}
       - SCAN_INTERVAL_SECS=${SCAN_INTERVAL_SECS:-300}
       - POCKETBASE_URL=http://pocketbase:8090
-      - REBUILD_MODE=${REBUILD_MODE:-false}
     volumes:
       - ${APPS}/rclone/config/rclone.conf:/rclone/rclone.conf:ro
       - ${MEDIA}:/media

@@ -1,6 +1,6 @@
 #!/command/with-contenv bash
 
-exec rclone mount zurg: /zurg \
+exec rclone mount zurg:__all__/ /zurg \
     --config /rclone/rclone.conf \
     --allow-other \
     --allow-non-empty \
