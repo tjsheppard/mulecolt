@@ -36,6 +36,8 @@ VIDEO_EXTENSIONS = {
     ".m4v", ".mpg", ".mpeg", ".ts", ".vob", ".iso", ".m2ts",
 }
 
+_SEASON_DIR_PATTERN = re.compile(r'(?:Season|S)\s*(\d+)', re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Minimal PocketBase client (subset of organiser's client)
@@ -310,11 +312,29 @@ def resolve_as_show(pb: PBClient, torrent: dict, tmdb_info: dict):
         print(f"  ERROR: No video files found at {torrent.get('path', '?')}")
         return
 
+    torrent_root = Path(torrent.get("path", ""))
+
     episodes_found = 0
     for vf in video_files:
         fg = guessit(vf.name, {"type": "episode"})
-        season = fg.get("season", 1)
+        season = fg.get("season")
         episode = fg.get("episode")
+
+        # Try parent directory for season (e.g. /Season 2/03) Foo.mkv)
+        if season is None:
+            try:
+                rel = vf.relative_to(torrent_root)
+                for part in rel.parts[:-1]:
+                    m = _SEASON_DIR_PATTERN.search(part)
+                    if m:
+                        season = int(m.group(1))
+                        break
+            except ValueError:
+                pass
+
+        # Default to season 1
+        if season is None:
+            season = 1
 
         if episode is None:
             print(f"  Skipping (no episode detected): {vf.name}")

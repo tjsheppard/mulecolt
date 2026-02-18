@@ -114,6 +114,30 @@ def validate_year(year: int | None, reference_text: str | None = None) -> int | 
 
 
 # ---------------------------------------------------------------------------
+# Season-from-path helper
+# ---------------------------------------------------------------------------
+
+_SEASON_DIR_PATTERN = re.compile(r'(?:Season|S)\s*(\d+)', re.IGNORECASE)
+
+
+def _extract_season_from_path(video_path: Path, torrent_root: Path) -> int | None:
+    """Extract season number from a file's parent directory structure.
+
+    Looks at the relative path between the torrent root and the file for
+    directory names like 'Season 1', 'Season 02', 'S3', etc.
+    """
+    try:
+        rel = video_path.relative_to(torrent_root)
+    except ValueError:
+        return None
+    for part in rel.parts[:-1]:  # skip the filename itself
+        m = _SEASON_DIR_PATTERN.search(part)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Media classification — show vs film
 # ---------------------------------------------------------------------------
 
@@ -985,7 +1009,12 @@ def _identify_show(folder_name: str, video_files: list[Path],
         season = file_guess.get("season")
         episode = file_guess.get("episode")
 
-        # Also check folder for season hint
+        # Try parent directory for season (e.g. /Season 2/03) Foo.mkv)
+        if season is None:
+            torrent_root = Path(torrent.get("path", ""))
+            season = _extract_season_from_path(video_path, torrent_root)
+
+        # Fall back to folder name, then default to 1
         if season is None:
             folder_guess_ep = guessit(folder_name, {"type": "episode"})
             season = folder_guess_ep.get("season", 1)
@@ -1187,12 +1216,17 @@ def _find_best_video_file(video_files: list[Path]) -> Path | None:
 
 
 def _match_episode_file(video_files: list[Path], season: int,
-                        episode: int) -> Path | None:
+                        episode: int, torrent_path: str = "") -> Path | None:
     """Find the video file matching a specific season/episode."""
+    torrent_root = Path(torrent_path) if torrent_path else None
     for vf in video_files:
         fg = guessit(vf.name, {"type": "episode"})
         file_season = fg.get("season")
         file_episode = fg.get("episode")
+
+        # Try parent directory for season if not in filename
+        if file_season is None and torrent_root:
+            file_season = _extract_season_from_path(vf, torrent_root)
 
         if file_episode is None:
             continue
@@ -1297,7 +1331,8 @@ def phase_d_build_symlinks():
         season = show.get("season", 1)
         episode = show.get("episode", 1)
 
-        matched_file = _match_episode_file(video_files, season, episode)
+        matched_file = _match_episode_file(video_files, season, episode,
+                                             torrent.get("path", ""))
         if not matched_file:
             continue
 
