@@ -1,0 +1,32 @@
+---
+- Services:
+    - Jellyfin:
+        icon: jellyfin.svg
+        href: https://jellyfin.<DOMAIN>
+        description: Media server
+        widget:
+          type: jellyfin
+          url: http://jellyfin:8096
+          key: <JELLYFIN_API_KEY>
+          enableBlocks: true
+    - Portainer:
+        icon: portainer.svg
+        href: https://portainer.<DOMAIN>
+        description: Container management
+        widget:
+          type: portainer
+          url: https://portainer:9443
+          env: 3
+          key: <PORTAINER_API_KEY>
+    - File Browser:
+        icon: filebrowser.svg
+        href: https://files.<DOMAIN>
+        description: File management
+    - Zurg:
+        icon: mdi-cloud-download
+        href: https://zurg.<DOMAIN>
+        description: Real Debrid mount
+    - PocketBase:
+        icon: mdi-database
+        href: https://pocketbase.<DOMAIN>/_/
+        description: Media database

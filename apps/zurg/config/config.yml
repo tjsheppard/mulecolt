@@ -1,0 +1,43 @@
+# Zurg configuration — Real Debrid WebDAV server
+# Docs: https://github.com/debridmediamanager/zurg-testing/wiki/Config
+# Note: __REAL_DEBRID_API_KEY__ is replaced at container start by entrypoint.sh
+
+zurg: v1
+token: __REAL_DEBRID_API_KEY__
+
+# Network
+# host: "[::]"
+# port: 9999
+
+# Performance
+check_for_changes_every_secs: 10
+rate_limit_sleep_secs: 6
+api_timeout_secs: 15
+# concurrent_workers: 20
+
+# Repair — automatically re-resolves broken/expired download links
+enable_repair: true
+repair_every_mins: 60
+
+# Cleanup
+auto_delete_rar_torrents: true
+retain_folder_name_extension: false
+# retain_rd_torrent_name: false
+
+# Directory structure — Zurg categorises your RD torrents into these directories
+# The organiser service then creates Jellyfin-compatible symlinks from these
+directories:
+  # TV shows — matched by episode patterns (S01E01, etc.)
+  shows:
+    group_order: 10
+    group: media
+    filters:
+      - has_episodes: true
+
+  # Films — everything else, show only the largest file per torrent
+  films:
+    group_order: 20
+    group: media
+    only_show_the_biggest_file: true
+    filters:
+      - regex: /.*/

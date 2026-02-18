@@ -1,0 +1,65 @@
+---
+- Discover:
+    - Debrid Media Manager:
+        - icon: mdi-multimedia
+          href: https://debridmediamanager.com
+    - Trakt:
+        - icon: trakt.svg
+          href: https://app.trakt.tv/
+
+- APIs:
+    - TMDb:
+        - icon: mdi-movie-search
+          href: https://www.themoviedb.org
+    - Real-Debrid:
+        - icon: mdi-cloud
+          href: https://real-debrid.com
+    - Tailscale:
+        - icon: tailscale.svg
+          href: https://login.tailscale.com/admin/machines
+    - Cloudflare:
+        - icon: cloudflare.svg
+          href: https://dash.cloudflare.com
+    - GitHub:
+        - icon: github.svg
+          href: https://github.com/tjsheppard/mulecolt
+
+- Projects:
+    - Jellyfin:
+        - icon: jellyfin.svg
+          href: https://github.com/jellyfin/jellyfin
+    - Zurg:
+        - icon: mdi-cloud-download
+          href: https://github.com/debridmediamanager/zurg-testing
+    - rclone:
+        - icon: mdi-folder-sync
+          href: https://github.com/rclone/rclone
+    - Caddy:
+        - icon: mdi-server-security
+          href: https://github.com/caddyserver/caddy
+    - Homepage:
+        - icon: homepage.svg
+          href: https://github.com/gethomepage/homepage
+    - File Browser:
+        - icon: filebrowser.svg
+          href: https://github.com/filebrowser/filebrowser
+    - Portainer:
+        - icon: portainer.svg
+          href: https://github.com/portainer/portainer
+    - guessit:
+        - icon: mdi-text-search
+          href: https://github.com/guessit-io/guessit
+
+- Local Access (<LOCAL_IP>):
+    - Jellyfin:
+        - abbr: JF
+          href: http://<LOCAL_IP>:8096
+    - File Browser:
+        - abbr: FB
+          href: http://<LOCAL_IP>:8080
+    - Portainer:
+        - abbr: PT
+          href: http://<LOCAL_IP>:9000
+    - Homepage:
+        - abbr: HP
+          href: http://<LOCAL_IP>:3000

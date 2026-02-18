@@ -1,0 +1,10 @@
+#!/command/with-contenv bash
+
+exec rclone mount zurg: /zurg \
+    --config /rclone/rclone.conf \
+    --allow-other \
+    --allow-non-empty \
+    --dir-cache-time 10s \
+    --vfs-cache-mode full \
+    --buffer-size 32M \
+    --vfs-read-ahead 128M

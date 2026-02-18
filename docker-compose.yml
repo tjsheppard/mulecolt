@@ -1,0 +1,135 @@
+services:
+  # Real Debrid mount — exposes RD library as a WebDAV server
+  zurg:
+    build: ${APPS}/zurg/config
+    container_name: zurg
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      - REAL_DEBRID_API_KEY=${REAL_DEBRID_API_KEY}
+    volumes:
+      - ${APPS}/zurg/config/config.yml:/app/config.yml
+      - zurgdata:/app/data
+    ports:
+      - 9999:9999
+
+  # Media organiser — mounts Zurg via its own rclone instance, then creates
+  # Jellyfin-compatible symlinks in /media pointing to /zurg/...
+  organiser:
+    build: ${APPS}/organiser/config
+    container_name: organiser
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      - SCAN_INTERVAL_SECS=${SCAN_INTERVAL_SECS:-300}
+      - POCKETBASE_URL=http://pocketbase:8090
+      - REBUILD_MODE=${REBUILD_MODE:-false}
+    volumes:
+      - ${APPS}/rclone/config/rclone.conf:/rclone/rclone.conf:ro
+      - ${MEDIA}:/media
+      - ${APPS}/organiser/data:/app/data
+    depends_on:
+      - zurg
+      - pocketbase
+
+  # PocketBase — TMDB lookup cache and media mapping database
+  pocketbase:
+    build: ${APPS}/pocketbase/config
+    container_name: pocketbase
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      - PB_ADMIN_EMAIL=${EMAIL:-}
+      - PB_ADMIN_PASSWORD=${PASSWORD:-}
+    volumes:
+      - ${APPS}/pocketbase/data:/pb/pb_data
+    ports:
+      - 8090:8090
+
+  # Dashboard
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - HOMEPAGE_ALLOWED_HOSTS=${DOMAIN:-localhost},${LOCAL_IP:-}
+    volumes:
+      - ${APPS}/homepage/data:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - 3000:3000
+
+  # Reverse proxy (requires TS_AUTHKEY, DOMAIN, CF_API_TOKEN, CF_ZONE_ID)
+  caddy:
+    build: ${APPS}/caddy/config
+    container_name: caddy
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - DOMAIN=${DOMAIN:-}
+      - CF_API_TOKEN=${CF_API_TOKEN:-}
+      - CF_ZONE_ID=${CF_ZONE_ID:-}
+      - TS_API_KEY=${TS_API_KEY:-}
+    volumes:
+      - ${APPS}/caddy/data/Caddyfile:/etc/caddy/Caddyfile
+      - ${APPS}/caddy/data:/data
+      - ${APPS}/caddy/data/tailscale-state:/config
+
+  # Media server — runs its own rclone mount at /zurg so it can follow
+  # the symlinks created by the organiser
+  jellyfin:
+    build: ${APPS}/jellyfin/config
+    container_name: jellyfin
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - ${APPS}/jellyfin/data:/config
+      - ${APPS}/rclone/config/rclone.conf:/rclone/rclone.conf:ro
+      - ${MEDIA}/films:/data/films
+      - ${MEDIA}/shows:/data/shows
+    ports:
+      - 8096:8096
+    depends_on:
+      - zurg
+
+  # File management
+  filebrowser:
+    container_name: filebrowser
+    image: filebrowser/filebrowser:latest
+    restart: unless-stopped
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+    volumes:
+      - ${APPS}:/srv/apps
+      - ${APPS}/filebrowser/data:/config
+      - ${APPS}/filebrowser/config/settings.json:/config/settings.json
+      - ${MEDIA}:/srv/media
+    ports:
+      - 8080:80
+
+  # Container management
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${APPS}/portainer/data:/data
+    ports:
+      - 9000:9000
+
+volumes:
+  zurgdata:

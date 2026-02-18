@@ -1,0 +1,64 @@
+{
+	tailscale {
+		ephemeral false
+	}
+}
+
+# Media server
+jellyfin.{$DOMAIN} {
+	bind tailscale/mulecolt
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	}
+	reverse_proxy jellyfin:8096
+}
+
+# Dashboard
+{$DOMAIN} {
+	bind tailscale/mulecolt
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	}
+	reverse_proxy homepage:3000
+}
+
+# Container management
+portainer.{$DOMAIN} {
+	bind tailscale/mulecolt
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	}
+	reverse_proxy portainer:9443 {
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+}
+
+# File management
+files.{$DOMAIN} {
+	bind tailscale/mulecolt
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	}
+	reverse_proxy filebrowser:80
+}
+
+# Zurg dashboard — Real Debrid library status
+zurg.{$DOMAIN} {
+	bind tailscale/mulecolt
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	}
+	reverse_proxy zurg:9999
+}
+
+# PocketBase — media database and TMDB cache
+pocketbase.{$DOMAIN} {
+	bind tailscale/mulecolt
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	}
+	redir / /_/ permanent
+	reverse_proxy pocketbase:8090
+}
