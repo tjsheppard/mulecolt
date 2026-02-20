@@ -8,7 +8,7 @@ deduplicating by quality score, and creating Jellyfin-compatible symlinks.
 PocketBase is the single source of truth. No local state files.
 
 Schema (PocketBase):
-  torrents:  id, name, path, score, archived, manual, hash, rd_id, repair_attempts
+  torrents:  id, name, path, score, archived, manual, hash, rd_id, rd_filename, repair_attempts
   films:     id, torrent (relation), tmdb_id, title, year
   shows:     id, torrent (relation), tmdb_id, title, year, season, episode
 
@@ -17,6 +17,7 @@ Workflow per scan:
   Phase B — Identify unidentified torrents (guessit + TMDB)
   Phase C — Detect removed torrents (path no longer on zurg)
   Phase D — Build symlinks from PocketBase state
+  Phase E — Clean up archived torrents (delete from RD + PocketBase)
 
 Unidentifiable torrents are flagged manual=true. Use resolve.sh to fix them.
 
@@ -31,6 +32,7 @@ Environment variables:
   JELLYFIN_API_KEY       — Jellyfin API key for triggering library refreshes
   JELLYFIN_URL           — Jellyfin base URL (default: http://jellyfin:8096)
   WEBHOOK_PORT           — port for the trigger webhook server (default: 8080)
+  CLEANUP_ARCHIVED       — delete archived torrents from RD + PocketBase (default: true)
 """
 
 import datetime
@@ -84,6 +86,9 @@ JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
 # Webhook server port (receives triggers from Zurg on_library_update)
 WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "8080"))
 
+# Archived torrent cleanup — delete from RD and PocketBase
+CLEANUP_ARCHIVED = os.environ.get("CLEANUP_ARCHIVED", "true").lower() in ("true", "1", "yes")
+
 TMDB_BASE = "https://api.themoviedb.org/3"
 
 VIDEO_EXTENSIONS = {
@@ -98,6 +103,21 @@ UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
 _CURRENT_YEAR = datetime.date.today().year
 _MIN_YEAR = 1920
 _MAX_YEAR = _CURRENT_YEAR + 1
+
+# Pattern to detect meaningless titles that need RD filename fallback
+_MEANINGLESS_TITLE = re.compile(
+    r'^(?:\d+|[\W_]+|.{0,2})$'  # all digits, all punctuation, or <=2 chars
+)
+
+
+def _is_meaningless_title(title: str) -> bool:
+    """Return True if a guessit-extracted title is too generic to identify.
+
+    Catches filenames like '00000', 'a', '_', etc. that would never match
+    a real TMDB entry.
+    """
+    return bool(_MEANINGLESS_TITLE.match(title.strip()))
+
 
 # Patterns that indicate a TV show (season/episode markers)
 _SHOW_PATTERNS = [
@@ -404,7 +424,8 @@ class PocketBaseClient:
         return None
 
     def create_torrent(self, name: str, path: str, score: int = 0,
-                       hash: str = "", rd_id: str = "") -> dict | None:
+                       hash: str = "", rd_id: str = "",
+                       rd_filename: str = "") -> dict | None:
         """Create a new torrent record."""
         data = {
             "name": name,
@@ -414,6 +435,7 @@ class PocketBaseClient:
             "manual": False,
             "hash": hash,
             "rd_id": rd_id,
+            "rd_filename": rd_filename,
             "repair_attempts": 0,
         }
         try:
@@ -446,6 +468,28 @@ class PocketBaseClient:
     def list_all_torrents(self) -> list[dict]:
         """Fetch all torrent records."""
         return self._paginate("torrents")
+
+    def list_archived_torrents(self) -> list[dict]:
+        """Fetch all archived torrent records."""
+        try:
+            items = []
+            page = 1
+            while True:
+                resp = self._session.get(
+                    self._url("torrents"),
+                    params={"filter": "archived = true", "perPage": 200, "page": page},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                items.extend(data.get("items", []))
+                if page >= data.get("totalPages", 1):
+                    break
+                page += 1
+            return items
+        except Exception as e:
+            log.warning(f"PocketBase list archived torrents failed: {e}")
+        return []
 
     # --- Films collection ---
 
@@ -925,29 +969,100 @@ def _torrent_has_media(torrent_id: str) -> bool:
     return False
 
 
-def _build_rd_lookup(rd_client: RealDebridClient | None) -> dict[str, dict]:
-    """Build a {filename → {hash, rd_id}} lookup dict from the RD API.
+def _build_rd_lookup(
+    rd_client: RealDebridClient | None,
+    torrent_entries: dict[str, list[Path]] | None = None,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Build RD lookup dicts from the RD API.
 
-    Called once per scan cycle to avoid per-torrent API calls.
-    Returns an empty dict if the RD client is not available.
+    Returns (primary, reverse) where:
+      primary  = {rd_filename → {hash, rd_id, rd_filename}}
+      reverse  = {internal_basename → {hash, rd_id, rd_filename}}
+
+    rd_filename is the best available name for identification — preferring
+    ``original_filename`` (the actual torrent name) over ``filename`` when
+    the latter is meaningless (e.g. ``00000.m2ts``).
+
+    The ``/torrents/info`` endpoint is called lazily for two cases:
+      1. Torrents whose ``filename`` looks meaningless — to fetch
+         ``original_filename`` (the real torrent name).
+      2. Torrents whose ``filename`` doesn't match any Zurg entry — to
+         build a reverse index from internal file basenames.
+    This avoids burning the ``/torrents/info`` rate-limit for the
+    common case where everything already matches cleanly.
+
+    Called once per scan cycle.
     """
+    empty: tuple[dict[str, dict], dict[str, dict]] = ({}, {})
     if rd_client is None:
-        return {}
+        return empty
 
-    lookup: dict[str, dict] = {}
+    primary: dict[str, dict] = {}
+    reverse: dict[str, dict] = {}
+    # Torrents that need a /torrents/info call (meaningless name or unmatched)
+    needs_info: list[dict] = []
+
     try:
         rd_torrents = rd_client.list_all_torrents()
         for t in rd_torrents:
             filename = t.get("filename", "")
-            if filename:
-                lookup[filename] = {
-                    "hash": t.get("hash", ""),
-                    "rd_id": t.get("id", ""),
-                }
-        log.info(f"  RD API: fetched {len(lookup)} torrent(s) for hash hydration")
+            if not filename:
+                continue
+
+            title_stem = Path(filename).stem
+            meta = {
+                "hash": t.get("hash", ""),
+                "rd_id": t.get("id", ""),
+                "rd_filename": filename,
+            }
+            primary[filename] = meta
+
+            # Queue for /torrents/info if:
+            # (a) the filename is meaningless → need original_filename, OR
+            # (b) the filename doesn't match any Zurg entry → need file list for reverse index
+            is_meaningless = _is_meaningless_title(title_stem)
+            is_unmatched = torrent_entries is not None and filename not in torrent_entries
+
+            if is_meaningless or is_unmatched:
+                needs_info.append(meta)
+
+        log.info(f"  RD API: fetched {len(primary)} torrent(s) for hash hydration")
     except Exception as e:
         log.warning(f"  RD API: failed to list torrents for hash hydration: {e}")
-    return lookup
+        return empty
+
+    # Enrich with /torrents/info for torrents that need it
+    if needs_info:
+        log.info(f"  RD API: enriching {len(needs_info)} torrent(s) via /torrents/info...")
+        for meta in needs_info:
+            rd_id = meta["rd_id"]
+            try:
+                info = rd_client.get_torrent_info(rd_id)
+                if not info:
+                    continue
+
+                # Upgrade rd_filename to original_filename if available
+                orig = info.get("original_filename", "")
+                if orig and orig != meta["rd_filename"]:
+                    log.info(f"  RD API: original_filename for "
+                             f"{meta['rd_filename']!r} → {orig!r}")
+                    meta["rd_filename"] = orig
+
+                # Build reverse index from internal file paths
+                for f in info.get("files", []):
+                    fpath = f.get("path", "")
+                    if not fpath:
+                        continue
+                    basename = Path(fpath).name
+                    if basename and basename not in reverse:
+                        reverse[basename] = meta
+            except Exception as e:
+                log.debug(f"  RD API: failed to get info for {rd_id}: {e}")
+
+        if reverse:
+            log.info(f"  RD API: reverse index has {len(reverse)} file-name mapping(s)")
+
+    return primary, reverse
 
 
 def phase_a_sync_torrents(torrent_entries: dict[str, list[Path]],
@@ -959,37 +1074,52 @@ def phase_a_sync_torrents(torrent_entries: dict[str, list[Path]],
     """
     needs_identification: list[tuple[str, dict]] = []
 
-    # Build RD lookup once per cycle
-    rd_lookup = _build_rd_lookup(rd_client)
+    # Build RD lookups once per cycle
+    rd_primary, rd_reverse = _build_rd_lookup(rd_client, torrent_entries)
 
     for folder_name, video_files in torrent_entries.items():
         torrent_path = _get_torrent_path(folder_name)
         existing = pb.get_torrent_by_path(torrent_path)
 
-        # Resolve RD metadata for this torrent
-        rd_meta = rd_lookup.get(folder_name, {})
+        # Resolve RD metadata — try primary (by RD filename), then reverse
+        # (by internal file basename) for loose-file torrents.
+        rd_meta = rd_primary.get(folder_name, {})
+        if not rd_meta:
+            rd_meta = rd_reverse.get(folder_name, {})
+            if rd_meta:
+                log.info(f"  RD reverse match: {folder_name} → {rd_meta.get('rd_filename', '?')}")
+
         rd_hash = rd_meta.get("hash", "")
         rd_id = rd_meta.get("rd_id", "")
+        rd_filename = rd_meta.get("rd_filename", "")
 
         if existing is None:
             # New torrent — create record and queue for identification
-            score = score_quality(folder_name)
+            # Use rd_filename for quality scoring if available and better
+            score_name = rd_filename if rd_filename else folder_name
+            score = score_quality(score_name)
             torrent = pb.create_torrent(
                 name=folder_name, path=torrent_path, score=score,
-                hash=rd_hash, rd_id=rd_id,
+                hash=rd_hash, rd_id=rd_id, rd_filename=rd_filename,
             )
             if torrent:
                 log.info(f"  New torrent: {folder_name}  {format_score(score)}")
                 needs_identification.append((folder_name, torrent))
             continue
 
-        # Existing torrent — hydrate hash/rd_id if missing or changed,
+        # Existing torrent — hydrate hash/rd_id/rd_filename if missing or changed,
         # and reset repair_attempts if torrent is back on the mount
         updates: dict = {}
         if rd_hash and existing.get("hash") != rd_hash:
             updates["hash"] = rd_hash
         if rd_id and existing.get("rd_id") != rd_id:
             updates["rd_id"] = rd_id
+        if rd_filename and existing.get("rd_filename") != rd_filename:
+            updates["rd_filename"] = rd_filename
+            # Recompute quality score from rd_filename if it's better
+            new_score = score_quality(rd_filename)
+            if new_score > existing.get("score", 0):
+                updates["score"] = new_score
         if existing.get("repair_attempts", 0) > 0:
             # Torrent path exists on mount → repair succeeded, reset counter
             updates["repair_attempts"] = 0
@@ -1025,12 +1155,25 @@ def _identify_film(folder_name: str, torrent: dict,
     """Try to identify a torrent as a film and handle duplicate resolution.
 
     Returns True if identified, False otherwise.
+    Falls back to the RD torrent filename when the Zurg entry name is
+    too generic (e.g. '00000.m2ts').
     """
     guess = guessit(folder_name, {"type": "movie"})
     title = guess.get("title", folder_name)
     year = validate_year(guess.get("year"), folder_name)
 
     tmdb = tmdb_search_film(title, year, _cache=tmdb_cache)
+
+    # Fallback: if the primary name yielded nothing useful, try rd_filename
+    if not tmdb and _is_meaningless_title(title):
+        rd_fn = torrent.get("rd_filename", "")
+        if rd_fn:
+            log.info(f"  Fallback to RD filename for film: {rd_fn}")
+            guess = guessit(rd_fn, {"type": "movie"})
+            title = guess.get("title", rd_fn)
+            year = validate_year(guess.get("year"), rd_fn)
+            tmdb = tmdb_search_film(title, year, _cache=tmdb_cache)
+
     if not tmdb:
         return False
 
@@ -1099,6 +1242,17 @@ def _identify_show(folder_name: str, video_files: list[Path],
         year = validate_year(folder_guess.get("year"), folder_name)
 
         tmdb = tmdb_search_tv(title, year, _cache=tmdb_cache)
+
+        # Fallback: if the primary name yielded nothing, try rd_filename
+        if not tmdb and _is_meaningless_title(title):
+            rd_fn = torrent.get("rd_filename", "")
+            if rd_fn:
+                log.info(f"  Fallback to RD filename for show: {rd_fn}")
+                folder_guess = guessit(rd_fn, {"type": "episode"})
+                title = folder_guess.get("title", rd_fn)
+                year = validate_year(folder_guess.get("year"), rd_fn)
+                tmdb = tmdb_search_tv(title, year, _cache=tmdb_cache)
+
         if tmdb:
             title = tmdb["title"]
             year = tmdb.get("year", year)
@@ -1673,6 +1827,36 @@ def phase_d_build_symlinks():
     return {"films_changed": films_changed, "shows_changed": shows_changed}
 
 
+def phase_e_cleanup_archived(rd: RealDebridClient | None):
+    """Delete archived torrents from Real-Debrid and PocketBase.
+
+    Archived torrents are duplicate losers — they have no linked media records
+    and serve no purpose. This phase removes them to free RD storage.
+    """
+    archived = pb.list_archived_torrents()
+    if not archived:
+        log.info("  No archived torrents to clean up")
+        return
+
+    log.info(f"  Found {len(archived)} archived torrent(s) to clean up")
+    deleted = 0
+
+    for torrent in archived:
+        name = torrent.get("name", torrent["id"])
+        rd_id = torrent.get("rd_id", "")
+
+        # Delete from Real-Debrid if we have an RD ID and a client
+        if rd and rd_id:
+            rd.delete_torrent(rd_id)
+
+        # Delete from PocketBase
+        pb.delete_torrent(torrent["id"])
+        log.info(f"  \U0001f5d1 {name}")
+        deleted += 1
+
+    log.info(f"  Cleaned up {deleted} archived torrent(s)")
+
+
 # ---------------------------------------------------------------------------
 # Jellyfin library refresh
 # ---------------------------------------------------------------------------
@@ -1809,6 +1993,11 @@ def run_scan():
     # Trigger Jellyfin library refresh for any changed libraries
     if changes:
         _trigger_jellyfin_refresh(changes["films_changed"], changes["shows_changed"])
+
+    # Phase E — Clean up archived torrents
+    if CLEANUP_ARCHIVED:
+        log.info("Phase E: Cleaning up archived torrents...")
+        phase_e_cleanup_archived(rd_client)
 
     # Summary
     all_torrents = pb.list_all_torrents()
