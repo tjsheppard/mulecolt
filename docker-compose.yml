@@ -21,7 +21,10 @@ services:
     build: ${APPS}/organiser/config
     container_name: organiser
     restart: unless-stopped
-    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
     networks:
       - mulecolt
     environment:
@@ -29,7 +32,7 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TMDB_API_KEY=${TMDB_API_KEY:-}
-      - SCAN_INTERVAL_SECS=${SCAN_INTERVAL_SECS:-30}
+      - SCAN_INTERVAL_SECS=${SCAN_INTERVAL_SECS:-300}
       - POCKETBASE_URL=http://pocketbase:8090
       - REAL_DEBRID_API_KEY=${REAL_DEBRID_API_KEY:-}
       - REPAIR_ENABLED=${REPAIR_ENABLED:-true}
@@ -40,7 +43,6 @@ services:
     volumes:
       - ${APPS}/rclone/config/rclone.conf:/rclone/rclone.conf:ro
       - ${MEDIA}:/media
-      - ${APPS}/organiser/data:/app/data
     depends_on:
       - zurg
       - pocketbase

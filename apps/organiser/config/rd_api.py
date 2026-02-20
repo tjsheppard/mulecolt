@@ -20,13 +20,11 @@ from typing import Any
 
 import requests
 
+from constants import VIDEO_EXTENSIONS
+
 log = logging.getLogger("organiser.rd_api")
 
 RD_BASE = "https://api.real-debrid.com/rest/1.0"
-
-# Video extensions considered when selecting files after magnet add
-_VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm",
-               ".m4v", ".mpg", ".mpeg", ".ts", ".vob", ".m2ts", ".iso"}
 
 
 class RealDebridError(Exception):
@@ -118,7 +116,7 @@ class RealDebridClient:
             size = f.get("bytes", 0)
             ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
 
-            if f".{ext}" in _VIDEO_EXTS and size >= self.min_file_size_bytes:
+            if f".{ext}" in VIDEO_EXTENSIONS and size >= self.min_file_size_bytes:
                 video_ids.append(f["id"])
 
         if not video_ids:

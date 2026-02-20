@@ -17,6 +17,7 @@ Two matching strategies are used (tried in order):
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 
 import requests
@@ -25,6 +26,10 @@ log = logging.getLogger("organiser")
 
 # Minimum confidence for title-based matching (0–1 scale).
 _TITLE_MATCH_THRESHOLD = 0.45
+
+# Retry configuration for TMDB API requests
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +91,29 @@ class ShowStructure:
 _structure_cache: dict[int, ShowStructure | None] = {}
 
 
+def _tmdb_get(url: str, params: dict, timeout: int = 10) -> requests.Response:
+    """Make a TMDB API request with retry and exponential backoff."""
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code in (429, 503) and attempt < _MAX_RETRIES:
+                wait = _RETRY_BACKOFF * (2 ** attempt)
+                log.warning(f"TMDB: {resp.status_code}, retrying in {wait:.0f}s "
+                            f"(attempt {attempt + 1}/{_MAX_RETRIES})")
+                time.sleep(wait)
+                continue
+            return resp
+        except requests.exceptions.RequestException as e:
+            if attempt < _MAX_RETRIES:
+                wait = _RETRY_BACKOFF * (2 ** attempt)
+                log.warning(f"TMDB: request error: {e}, retrying in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            raise
+    # Should not reach here, but satisfy type checker
+    raise requests.exceptions.RequestException("Max retries exceeded")
+
+
 def tmdb_get_show_structure(tmdb_id: int, api_key: str,
                             base_url: str = "https://api.themoviedb.org/3",
                             ) -> ShowStructure | None:
@@ -103,10 +131,9 @@ def tmdb_get_show_structure(tmdb_id: int, api_key: str,
 
     try:
         # 1. Fetch the show to get the list of seasons
-        resp = requests.get(
+        resp = _tmdb_get(
             f"{base_url}/tv/{tmdb_id}",
             params={"api_key": api_key},
-            timeout=10,
         )
         resp.raise_for_status()
         show_data = resp.json()
@@ -125,10 +152,9 @@ def tmdb_get_show_structure(tmdb_id: int, api_key: str,
             continue
 
         try:
-            resp = requests.get(
+            resp = _tmdb_get(
                 f"{base_url}/tv/{tmdb_id}/season/{season_num}",
                 params={"api_key": api_key},
-                timeout=10,
             )
             resp.raise_for_status()
             season_data = resp.json()

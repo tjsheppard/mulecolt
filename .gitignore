@@ -5,3 +5,7 @@ apps/*/data/
 media/*
 .env
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc

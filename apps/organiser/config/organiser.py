@@ -31,6 +31,7 @@ Environment variables:
   MIN_VIDEO_FILE_SIZE_MB — minimum file size for repair file selection (default: 100)
   JELLYFIN_API_KEY       — Jellyfin API key for triggering library refreshes
   JELLYFIN_URL           — Jellyfin base URL (default: http://jellyfin:8096)
+  JELLYFIN_ZURG_PATH     — Zurg mount path inside Jellyfin container (default: /zurg)
   WEBHOOK_PORT           — port for the trigger webhook server (default: 8080)
   CLEANUP_ARCHIVED       — delete archived torrents from RD + PocketBase (default: true)
 """
@@ -41,13 +42,43 @@ import os
 import re
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import requests
 from guessit import guessit
 
+from constants import (
+    CLEANUP_ARCHIVED,
+    FILMS_DIR,
+    JELLYFIN_ZURG_PATH,
+    MAX_REPAIR_ATTEMPTS,
+    MEDIA_DIR,
+    MIN_VIDEO_FILE_SIZE_MB,
+    POCKETBASE_URL,
+    REAL_DEBRID_API_KEY,
+    REPAIR_ENABLED,
+    SCAN_INTERVAL,
+    SHOW_PATTERNS,
+    SHOWS_DIR,
+    TMDB_API_KEY,
+    TMDB_BASE,
+    VIDEO_EXTENSIONS,
+    WEBHOOK_PORT,
+    ZURG_MOUNT,
+    is_meaningless_title,
+    validate_year,
+)
+from formatting import format_episode, format_media_name
+from media_resolver import (
+    extract_season_from_path,
+    get_video_files,
+    maybe_archive_orphan,
+    resolve_episode_duplicate,
+    resolve_film_duplicate,
+)
+from pb_client import PocketBaseClient
 from rd_api import RealDebridClient
+from scoring import format_score, score_quality
 from tmdb_utils import (
     ShowStructure,
     clear_structure_cache,
@@ -55,81 +86,12 @@ from tmdb_utils import (
     tmdb_get_show_structure,
 )
 
+import jellyfin as jellyfin_mod
+import webhook as webhook_mod
+
 # ---------------------------------------------------------------------------
-# Configuration
+# Logging
 # ---------------------------------------------------------------------------
-
-ZURG_MOUNT = Path("/zurg")
-MEDIA_DIR = Path("/media")
-
-# The path where the Zurg mount appears inside Jellyfin's container.
-JELLYFIN_ZURG_PATH = Path(os.environ.get("JELLYFIN_ZURG_PATH", "/zurg"))
-
-FILMS_DIR = MEDIA_DIR / "films"
-SHOWS_DIR = MEDIA_DIR / "shows"
-
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SECS", "300"))
-
-POCKETBASE_URL = os.environ.get("POCKETBASE_URL", "http://pocketbase:8090")
-
-# Repair configuration
-REAL_DEBRID_API_KEY = os.environ.get("REAL_DEBRID_API_KEY", "")
-REPAIR_ENABLED = os.environ.get("REPAIR_ENABLED", "true").lower() in ("true", "1", "yes")
-MAX_REPAIR_ATTEMPTS = int(os.environ.get("MAX_REPAIR_ATTEMPTS", "3"))
-MIN_VIDEO_FILE_SIZE_MB = int(os.environ.get("MIN_VIDEO_FILE_SIZE_MB", "100"))
-
-# Jellyfin library-refresh configuration
-JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://jellyfin:8096")
-JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
-
-# Webhook server port (receives triggers from Zurg on_library_update)
-WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "8080"))
-
-# Archived torrent cleanup — delete from RD and PocketBase
-CLEANUP_ARCHIVED = os.environ.get("CLEANUP_ARCHIVED", "true").lower() in ("true", "1", "yes")
-
-TMDB_BASE = "https://api.themoviedb.org/3"
-
-VIDEO_EXTENSIONS = {
-    ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm",
-    ".m4v", ".mpg", ".mpeg", ".ts", ".vob", ".iso", ".m2ts",
-}
-
-# Characters that are not allowed in filenames (Jellyfin restriction)
-UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
-
-# Year plausibility range for validation
-_CURRENT_YEAR = datetime.date.today().year
-_MIN_YEAR = 1920
-_MAX_YEAR = _CURRENT_YEAR + 1
-
-# Pattern to detect meaningless titles that need RD filename fallback
-_MEANINGLESS_TITLE = re.compile(
-    r'^(?:\d+|[\W_]+|.{0,2})$'  # all digits, all punctuation, or <=2 chars
-)
-
-
-def _is_meaningless_title(title: str) -> bool:
-    """Return True if a guessit-extracted title is too generic to identify.
-
-    Catches filenames like '00000', 'a', '_', etc. that would never match
-    a real TMDB entry.
-    """
-    return bool(_MEANINGLESS_TITLE.match(title.strip()))
-
-
-# Patterns that indicate a TV show (season/episode markers)
-_SHOW_PATTERNS = [
-    re.compile(r'[Ss]\d{1,2}[Ee]\d{1,3}'),            # S01E01
-    re.compile(r'[Ss]\d{1,2}'),                         # S01
-    re.compile(r'[Ss]eason[\s._-]?\d', re.IGNORECASE),  # Season 1
-    re.compile(r'[Ee]\d{2,3}'),                          # E01, E001
-    re.compile(r'Episode[\s._-]?\d', re.IGNORECASE),     # Episode 1
-    re.compile(r'\bComplete[\s._-]?Series\b', re.IGNORECASE),
-    re.compile(r'\bBatch\b', re.IGNORECASE),
-    re.compile(r'\b\d{1,2}x\d{2}\b'),                   # 1x01 format
-]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,53 +100,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("organiser")
 
-
-# ---------------------------------------------------------------------------
-# Year validation
-# ---------------------------------------------------------------------------
-
-def validate_year(year: int | None, reference_text: str | None = None) -> int | None:
-    """Validate an extracted year for plausibility.
-
-    Returns the year if it passes validation, otherwise None.
-
-    Rules:
-      - Must be within [1920, current_year + 1]
-      - If reference_text is provided (e.g. the folder name), the year must
-        appear literally in that text.  This prevents guessit from extracting
-        years embedded in episode titles (e.g. "To You, in 2000 Years").
-    """
-    if year is None:
-        return None
-    if not (_MIN_YEAR <= year <= _MAX_YEAR):
-        return None
-    if reference_text is not None and str(year) not in reference_text:
-        return None
-    return year
-
-
-# ---------------------------------------------------------------------------
-# Season-from-path helper
-# ---------------------------------------------------------------------------
-
-_SEASON_DIR_PATTERN = re.compile(r'(?:Season|S)\s*(\d+)', re.IGNORECASE)
-
-
-def _extract_season_from_path(video_path: Path, torrent_root: Path) -> int | None:
-    """Extract season number from a file's parent directory structure.
-
-    Looks at the relative path between the torrent root and the file for
-    directory names like 'Season 1', 'Season 02', 'S3', etc.
-    """
-    try:
-        rel = video_path.relative_to(torrent_root)
-    except ValueError:
-        return None
-    for part in rel.parts[:-1]:  # skip the filename itself
-        m = _SEASON_DIR_PATTERN.search(part)
-        if m:
-            return int(m.group(1))
-    return None
+# Global PocketBase client
+pb = PocketBaseClient(POCKETBASE_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -195,31 +112,24 @@ def _classify_torrent(folder_name: str, files: list[Path]) -> str:
     """Classify a torrent entry as 'show' or 'film'.
 
     Strategy:
-      1. Check folder name for show patterns (S01E01, Season, etc.)
+      1. Check folder name for show patterns
       2. Check individual filenames for episode patterns
       3. Multiple video files → likely a show (season pack)
       4. Fall back to 'film'
-
-    Returns 'show' or 'film'.
     """
-    # Check folder name for show patterns
-    for pattern in _SHOW_PATTERNS:
+    for pattern in SHOW_PATTERNS:
         if pattern.search(folder_name):
             return "show"
 
-    # Check filenames — if most files have episode markers, it's a show
     if files:
-        filenames = [f.name for f in files[:20]]  # sample first 20
-        ep_count = 0
-        for fn in filenames:
-            for pattern in _SHOW_PATTERNS:
-                if pattern.search(fn):
-                    ep_count += 1
-                    break
+        filenames = [f.name for f in files[:20]]
+        ep_count = sum(
+            1 for fn in filenames
+            if any(p.search(fn) for p in SHOW_PATTERNS)
+        )
         if ep_count > len(filenames) / 2:
             return "show"
 
-        # Multiple video files usually means a season pack
         video_count = sum(1 for f in files if f.suffix.lower() in VIDEO_EXTENSIONS)
         if video_count > 3:
             return "show"
@@ -228,12 +138,7 @@ def _classify_torrent(folder_name: str, files: list[Path]) -> str:
 
 
 def _scan_zurg_mount() -> dict[str, list[Path]]:
-    """Scan the flat Zurg mount and return {folder_name: [file_paths]}.
-
-    Handles both:
-      - Torrent folders: /zurg/Some.Show.S01/episode1.mkv
-      - Loose files:     /zurg/Some.Movie.2023.mkv
-    """
+    """Scan the flat Zurg mount and return {folder_name: [video_file_paths]}."""
     results: dict[str, list[Path]] = {}
 
     if not ZURG_MOUNT.exists():
@@ -248,7 +153,6 @@ def _scan_zurg_mount() -> dict[str, list[Path]]:
 
     for entry in entries:
         if entry.is_dir():
-            # Torrent folder — collect all video files recursively
             video_files = []
             try:
                 for item in entry.rglob("*"):
@@ -259,476 +163,14 @@ def _scan_zurg_mount() -> dict[str, list[Path]]:
             if video_files:
                 results[entry.name] = video_files
         elif entry.is_file() and entry.suffix.lower() in VIDEO_EXTENSIONS:
-            # Loose file — the filename is the "folder name"
             results[entry.name] = [entry]
 
     return results
 
 
 # ---------------------------------------------------------------------------
-# Quality scoring — when duplicates exist, the highest score wins
+# TMDb search (with scoring and caching)
 # ---------------------------------------------------------------------------
-
-RESOLUTION_SCORES = {
-    "4320p": 100,  # 8K
-    "2160p": 90,   # 4K
-    "1080p": 70,
-    "1080i": 65,
-    "720p":  50,
-    "576p":  30,
-    "480p":  20,
-    "360p":  10,
-}
-
-SOURCE_SCORES = {
-    "Blu-ray":    60,
-    "Ultra HD Blu-ray": 65,
-    "HD-DVD":     55,
-    "Web":        40,
-    "HDTV":       35,
-    "PDTV":       25,
-    "SDTV":       20,
-    "DVD":        30,
-    "VHS":        5,
-    "Telecine":   10,
-    "Telesync":   8,
-    "Workprint":  3,
-    "Camera":     1,
-}
-
-CODEC_SCORES = {
-    "H.265": 30,
-    "HEVC":  30,
-    "H.264": 20,
-    "AVC":   20,
-    "VP9":   18,
-    "AV1":   35,
-    "MPEG-2": 5,
-    "XviD":   3,
-    "DivX":   3,
-}
-
-# Bonus points for various quality markers
-REMUX_BONUS = 25       # Remux = untouched disc stream
-HDR_BONUS = 15         # Any HDR (HDR10, HDR10+, Dolby Vision, HLG)
-ATMOS_BONUS = 10       # Dolby Atmos / DTS:X
-LOSSLESS_AUDIO_BONUS = 8  # DTS-HD MA, TrueHD, FLAC, PCM
-
-
-def score_quality(name: str) -> int:
-    """Score a torrent/file name by quality. Higher = better."""
-    guess = guessit(name)
-    score = 0
-
-    # Resolution
-    res = guess.get("screen_size", "")
-    score += RESOLUTION_SCORES.get(res, 0)
-
-    # Source
-    source = guess.get("source", "")
-    if isinstance(source, list):
-        score += max(SOURCE_SCORES.get(s, 0) for s in source)
-    else:
-        score += SOURCE_SCORES.get(source, 0)
-
-    # Video codec
-    codec = guess.get("video_codec", "")
-    score += CODEC_SCORES.get(codec, 0)
-
-    # Remux bonus
-    name_upper = name.upper()
-    if "REMUX" in name_upper:
-        score += REMUX_BONUS
-
-    # HDR bonus
-    other = guess.get("other", [])
-    if not isinstance(other, list):
-        other = [other]
-    hdr_terms = {"HDR10", "HDR10+", "HDR", "Dolby Vision", "DV", "HLG", "HDR10Plus"}
-    if any(o in hdr_terms for o in other) or any(t in name_upper for t in ("HDR", "DV", "DOLBY.VISION")):
-        score += HDR_BONUS
-
-    # Lossless audio bonus
-    audio = guess.get("audio_codec", "")
-    if isinstance(audio, list):
-        audio = " ".join(audio)
-    audio_str = f"{audio} {name_upper}"
-    if any(t in audio_str for t in ("DTS-HD", "DTS-HD MA", "TRUEHD", "TRUE HD", "FLAC", "PCM", "LPCM")):
-        score += LOSSLESS_AUDIO_BONUS
-
-    # Atmos / DTS:X bonus
-    if "ATMOS" in name_upper or "DTS:X" in name_upper or "DTS-X" in name_upper:
-        score += ATMOS_BONUS
-
-    return score
-
-
-def format_score(score: int) -> str:
-    """Human-readable quality score label."""
-    if score >= 200:
-        return f"★★★★★ ({score})"
-    if score >= 150:
-        return f"★★★★ ({score})"
-    if score >= 100:
-        return f"★★★ ({score})"
-    if score >= 50:
-        return f"★★ ({score})"
-    return f"★ ({score})"
-
-
-# ---------------------------------------------------------------------------
-# PocketBase client — new torrent-centric schema
-# ---------------------------------------------------------------------------
-
-class PocketBaseClient:
-    """Lightweight PocketBase REST API client for the organiser."""
-
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
-        self.api = f"{self.base_url}/api"
-        self._session = requests.Session()
-
-    def _url(self, collection: str, record_id: str = "") -> str:
-        url = f"{self.api}/collections/{collection}/records"
-        if record_id:
-            url += f"/{record_id}"
-        return url
-
-    # --- Torrents collection ---
-
-    def get_torrent_by_path(self, path: str) -> dict | None:
-        """Look up a torrent record by its zurg path."""
-        try:
-            filt = f'path = "{self._escape(path)}"'
-            resp = self._session.get(
-                self._url("torrents"),
-                params={"filter": filt, "perPage": 1},
-                timeout=5,
-            )
-            resp.raise_for_status()
-            items = resp.json().get("items", [])
-            if items:
-                return items[0]
-        except Exception as e:
-            log.debug(f"PocketBase torrent query failed: {e}")
-        return None
-
-    def get_torrent_by_id(self, record_id: str) -> dict | None:
-        """Look up a torrent record by PocketBase ID."""
-        try:
-            resp = self._session.get(self._url("torrents", record_id), timeout=5)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            log.debug(f"PocketBase torrent get failed: {e}")
-        return None
-
-    def create_torrent(self, name: str, path: str, score: int = 0,
-                       hash: str = "", rd_id: str = "",
-                       rd_filename: str = "") -> dict | None:
-        """Create a new torrent record."""
-        data = {
-            "name": name,
-            "path": path,
-            "score": score,
-            "archived": False,
-            "manual": False,
-            "hash": hash,
-            "rd_id": rd_id,
-            "rd_filename": rd_filename,
-            "repair_attempts": 0,
-        }
-        try:
-            resp = self._session.post(self._url("torrents"), json=data, timeout=5)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            log.debug(f"PocketBase create torrent failed: {e}")
-        return None
-
-    def update_torrent(self, record_id: str, **fields) -> dict | None:
-        """Update fields on a torrent record."""
-        try:
-            resp = self._session.patch(
-                self._url("torrents", record_id), json=fields, timeout=5,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            log.debug(f"PocketBase update torrent failed: {e}")
-        return None
-
-    def delete_torrent(self, record_id: str):
-        """Delete a torrent record."""
-        try:
-            self._session.delete(self._url("torrents", record_id), timeout=5).raise_for_status()
-        except Exception as e:
-            log.debug(f"PocketBase delete torrent failed: {e}")
-
-    def list_all_torrents(self) -> list[dict]:
-        """Fetch all torrent records."""
-        return self._paginate("torrents")
-
-    def list_archived_torrents(self) -> list[dict]:
-        """Fetch all archived torrent records."""
-        try:
-            items = []
-            page = 1
-            while True:
-                resp = self._session.get(
-                    self._url("torrents"),
-                    params={"filter": "archived = true", "perPage": 200, "page": page},
-                    timeout=10,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                items.extend(data.get("items", []))
-                if page >= data.get("totalPages", 1):
-                    break
-                page += 1
-            return items
-        except Exception as e:
-            log.warning(f"PocketBase list archived torrents failed: {e}")
-        return []
-
-    # --- Films collection ---
-
-    def get_film_by_tmdb(self, tmdb_id: int) -> dict | None:
-        """Look up a film record by TMDB ID."""
-        try:
-            filt = f'tmdb_id = {tmdb_id}'
-            resp = self._session.get(
-                self._url("films"),
-                params={"filter": filt, "perPage": 1, "expand": "torrent"},
-                timeout=5,
-            )
-            resp.raise_for_status()
-            items = resp.json().get("items", [])
-            if items:
-                return items[0]
-        except Exception as e:
-            log.debug(f"PocketBase film query failed: {e}")
-        return None
-
-    def create_film(self, torrent_id: str, tmdb_id: int,
-                    title: str, year: int | None) -> dict | None:
-        """Create a new film record."""
-        data = {
-            "torrent": torrent_id,
-            "tmdb_id": tmdb_id,
-            "title": title,
-            "year": year or 0,
-        }
-        try:
-            resp = self._session.post(self._url("films"), json=data, timeout=5)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            log.debug(f"PocketBase create film failed: {e}")
-        return None
-
-    def update_film(self, record_id: str, **fields) -> dict | None:
-        """Update fields on a film record."""
-        try:
-            resp = self._session.patch(
-                self._url("films", record_id), json=fields, timeout=5,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            log.debug(f"PocketBase update film failed: {e}")
-        return None
-
-    def list_all_films(self) -> list[dict]:
-        """Fetch all film records, expanding the torrent relation."""
-        return self._paginate("films", expand="torrent")
-
-    def list_films_by_torrent(self, torrent_id: str) -> list[dict]:
-        """Find all film records linked to a specific torrent."""
-        try:
-            filt = f'torrent = "{self._escape(torrent_id)}"'
-            resp = self._session.get(
-                self._url("films"),
-                params={"filter": filt, "perPage": 200},
-                timeout=5,
-            )
-            resp.raise_for_status()
-            return resp.json().get("items", [])
-        except Exception as e:
-            log.debug(f"PocketBase films by torrent query failed: {e}")
-        return []
-
-    # --- Shows collection ---
-
-    def get_show_episode(self, tmdb_id: int, season: int,
-                         episode: int) -> dict | None:
-        """Look up a show episode by (tmdb_id, season, episode)."""
-        try:
-            filt = f'tmdb_id = {tmdb_id} && season = {season} && episode = {episode}'
-            resp = self._session.get(
-                self._url("shows"),
-                params={"filter": filt, "perPage": 1, "expand": "torrent"},
-                timeout=5,
-            )
-            resp.raise_for_status()
-            items = resp.json().get("items", [])
-            if items:
-                return items[0]
-        except Exception as e:
-            log.debug(f"PocketBase show episode query failed: {e}")
-        return None
-
-    def create_show(self, torrent_id: str, tmdb_id: int, title: str,
-                    year: int | None, season: int,
-                    episode: int) -> dict | None:
-        """Create a new show episode record."""
-        data = {
-            "torrent": torrent_id,
-            "tmdb_id": tmdb_id,
-            "title": title,
-            "year": year or 0,
-            "season": season,
-            "episode": episode,
-        }
-        try:
-            resp = self._session.post(self._url("shows"), json=data, timeout=5)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            log.debug(f"PocketBase create show failed: {e}")
-        return None
-
-    def update_show(self, record_id: str, **fields) -> dict | None:
-        """Update fields on a show record."""
-        try:
-            resp = self._session.patch(
-                self._url("shows", record_id), json=fields, timeout=5,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            log.debug(f"PocketBase update show failed: {e}")
-        return None
-
-    def list_all_shows(self) -> list[dict]:
-        """Fetch all show records, expanding the torrent relation."""
-        return self._paginate("shows", expand="torrent")
-
-    def list_shows_by_torrent(self, torrent_id: str) -> list[dict]:
-        """Find all show records linked to a specific torrent."""
-        try:
-            filt = f'torrent = "{self._escape(torrent_id)}"'
-            resp = self._session.get(
-                self._url("shows"),
-                params={"filter": filt, "perPage": 200},
-                timeout=5,
-            )
-            resp.raise_for_status()
-            return resp.json().get("items", [])
-        except Exception as e:
-            log.debug(f"PocketBase shows by torrent query failed: {e}")
-        return []
-
-    # --- Helpers ---
-
-    def _paginate(self, collection: str, expand: str = "") -> list[dict]:
-        items = []
-        page = 1
-        params: dict = {"perPage": 200, "page": page}
-        if expand:
-            params["expand"] = expand
-        while True:
-            try:
-                params["page"] = page
-                resp = self._session.get(self._url(collection), params=params, timeout=10)
-                resp.raise_for_status()
-                data = resp.json()
-                items.extend(data.get("items", []))
-                if page >= data.get("totalPages", 1):
-                    break
-                page += 1
-            except Exception as e:
-                log.warning(f"PocketBase list {collection} failed: {e}")
-                break
-        return items
-
-    def health_check(self) -> bool:
-        """Check if PocketBase is reachable."""
-        try:
-            resp = self._session.get(f"{self.base_url}/api/health", timeout=5)
-            return resp.status_code == 200
-        except Exception:
-            return False
-
-    @staticmethod
-    def _escape(value: str) -> str:
-        """Escape a string for PocketBase filter syntax."""
-        return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-# Global PocketBase client
-pb = PocketBaseClient(POCKETBASE_URL)
-
-
-# ---------------------------------------------------------------------------
-# TMDb lookup
-# ---------------------------------------------------------------------------
-
-def tmdb_search_film(title: str, year: int | None = None,
-                     _cache: dict | None = None) -> dict | None:
-    """Search TMDb for a film, return {title, year, tmdb_id} or None.
-
-    Uses an in-memory cache per scan cycle to avoid duplicate API calls.
-    Cache key includes the year so that same-title different-year entries
-    (e.g. "Mirror" 1975 vs 2012) are kept separate.
-    """
-    cache_key = (title.lower(), year)
-    if _cache is not None and cache_key in _cache:
-        return _cache[cache_key]
-
-    if not TMDB_API_KEY:
-        return None
-
-    params = {"api_key": TMDB_API_KEY, "query": title}
-    if year:
-        params["year"] = year
-    try:
-        resp = requests.get(f"{TMDB_BASE}/search/movie", params=params, timeout=10)
-        resp.raise_for_status()
-        results = resp.json().get("results", [])
-
-        # If year-filtered search returned nothing, retry without year filter
-        if not results and year:
-            params_no_year = {"api_key": TMDB_API_KEY, "query": title}
-            resp = requests.get(f"{TMDB_BASE}/search/movie", params=params_no_year, timeout=10)
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-
-        if results:
-            scored = [
-                (r, _score_tmdb_result(title, r, year,
-                                       name_key="title",
-                                       date_key="release_date",
-                                       search_rank=i))
-                for i, r in enumerate(results)
-            ]
-            scored.sort(key=lambda x: x[1], reverse=True)
-            r = scored[0][0]
-
-            release = r.get("release_date", "")
-            result = {
-                "title": r["title"],
-                "year": int(release[:4]) if release and len(release) >= 4 else year,
-                "tmdb_id": r["id"],
-            }
-            if _cache is not None:
-                _cache[cache_key] = result
-            log.info(f"  TMDb API → {title} = {result['title']} ({result['year']}) [tmdbid={result['tmdb_id']}]")
-            return result
-    except Exception as e:
-        log.debug(f"TMDb film search failed for '{title}': {e}")
-    return None
-
 
 def _score_tmdb_result(query_title: str, result: dict,
                        query_year: int | None,
@@ -737,15 +179,8 @@ def _score_tmdb_result(query_title: str, result: dict,
                        search_rank: int = 0) -> float:
     """Score a single TMDB result against the query title/year.
 
-    Higher score = better match.  Uses word overlap between the query and
-    the result's name/original_name, plus year proximity if available.
-
-    *search_rank* is the 0-based position in TMDB's own search results.
-    A small descending bonus is added so that, when the scoring function
-    cannot differentiate results (e.g. non-Latin query words that don't
-    appear in the English name or original_name fields), TMDB's own
-    relevance ordering — which considers alternative titles, translations,
-    etc. — acts as a tiebreaker.
+    Uses word overlap (Jaccard) between the query and the result's
+    name/original_name, plus year proximity and recency bonuses.
     """
     def _words(text: str) -> set[str]:
         return set(re.findall(r'[a-z0-9]+', text.lower()))
@@ -754,24 +189,17 @@ def _score_tmdb_result(query_title: str, result: dict,
     if not query_words:
         return 0.0
 
-    # Check both the localised name and the original name
     name = result.get(name_key, "")
     original_name = result.get("original_name", result.get("original_title", ""))
 
     name_words = _words(name)
     orig_words = _words(original_name)
 
-    # Jaccard similarity — penalises results with extra words in the name
-    # so that e.g. "Shogun" (exact) scores 1.0 but "Abarenbo Shogun" only 0.5.
     overlap_name = len(query_words & name_words) / len(query_words | name_words) if query_words else 0
     overlap_orig = len(query_words & orig_words) / len(query_words | orig_words) if query_words else 0
     title_score = max(overlap_name, overlap_orig)
 
-    # Year proximity bonus / penalty.
-    # When the torrent name includes a year, it is a strong signal — matching
-    # the correct year is more important than popularity.  A large penalty for
-    # year mismatch prevents e.g. "Doctor Who 2005" from stealing the match
-    # when the query specifies 2023.
+    # Year proximity
     year_score = 0.0
     if query_year:
         air_date = result.get(date_key, "")
@@ -786,16 +214,11 @@ def _score_tmdb_result(query_title: str, result: dict,
                 elif diff <= 2:
                     year_score = 0.1
                 else:
-                    # Significant year gap — penalise heavily so a popular
-                    # but wrong-year show cannot win on popularity alone.
                     year_score = -0.5
             except ValueError:
                 pass
 
-    # Recency bias — when no year is provided in the torrent name, gently
-    # prefer shows that aired recently.  This helps when two results have
-    # similar title scores but very different air dates (e.g. a 2024 show
-    # vs a 1978 show for a bare "Shogun" query).
+    # Recency bias (when no year provided)
     recency_bonus = 0.0
     if not query_year:
         air_date = result.get(date_key, "")
@@ -812,25 +235,20 @@ def _score_tmdb_result(query_title: str, result: dict,
             except ValueError:
                 pass
 
-    # Popularity tiebreaker (normalised, max 0.10)
-    popularity = result.get("popularity", 0)
-    pop_score = min(popularity / 500, 0.10)
-
-    # TMDB search-rank bonus — preserves TMDB's own relevance ordering as
-    # a tiebreaker.  Decays with position so only the top few results get
-    # a meaningful boost (max 0.04 for rank 0, 0 at rank 20+).
+    pop_score = min(result.get("popularity", 0) / 500, 0.10)
     rank_bonus = max(0.0, 0.04 - search_rank * 0.002)
 
     return title_score + year_score + recency_bonus + pop_score + rank_bonus
 
 
-def tmdb_search_tv(title: str, year: int | None = None,
-                   _cache: dict | None = None) -> dict | None:
-    """Search TMDb for a TV show, return {title, year, tmdb_id} or None.
+def _tmdb_search(title: str, year: int | None, media_type: str,
+                 _cache: dict | None = None) -> dict | None:
+    """Search TMDb for a film or TV show.
 
-    Uses an in-memory cache per scan cycle to avoid duplicate API calls.
-    Cache key includes the year so that same-title different-year shows
-    (e.g. "Doctor Who" 2005 vs 2023) are kept separate.
+    Args:
+        media_type: "film" or "show"
+
+    Returns {title, year, tmdb_id} or None.
     """
     cache_key = (title.lower(), year)
     if _cache is not None and cache_key in _cache:
@@ -839,156 +257,73 @@ def tmdb_search_tv(title: str, year: int | None = None,
     if not TMDB_API_KEY:
         return None
 
-    params = {"api_key": TMDB_API_KEY, "query": title}
+    if media_type == "film":
+        endpoint = f"{TMDB_BASE}/search/movie"
+        name_key, date_key = "title", "release_date"
+        year_param = "year"
+    else:
+        endpoint = f"{TMDB_BASE}/search/tv"
+        name_key, date_key = "name", "first_air_date"
+        year_param = "first_air_date_year"
+
+    params: dict = {"api_key": TMDB_API_KEY, "query": title}
     if year:
-        params["first_air_date_year"] = year
+        params[year_param] = year
+
     try:
-        resp = requests.get(f"{TMDB_BASE}/search/tv", params=params, timeout=10)
+        resp = requests.get(endpoint, params=params, timeout=10)
         resp.raise_for_status()
         results = resp.json().get("results", [])
 
-        # If year-filtered search returned nothing, retry without year filter
+        # Retry without year filter if no results
         if not results and year:
-            params_no_year = {"api_key": TMDB_API_KEY, "query": title}
-            resp = requests.get(f"{TMDB_BASE}/search/tv", params=params_no_year, timeout=10)
+            params_retry = {"api_key": TMDB_API_KEY, "query": title}
+            resp = requests.get(endpoint, params=params_retry, timeout=10)
             resp.raise_for_status()
             results = resp.json().get("results", [])
 
         if results:
             scored = [
                 (r, _score_tmdb_result(title, r, year,
-                                       name_key="name",
-                                       date_key="first_air_date",
+                                       name_key=name_key,
+                                       date_key=date_key,
                                        search_rank=i))
                 for i, r in enumerate(results)
             ]
             scored.sort(key=lambda x: x[1], reverse=True)
             r = scored[0][0]
 
-            air_date = r.get("first_air_date", "")
+            date_str = r.get(date_key, "")
             result = {
-                "title": r["name"],
-                "year": int(air_date[:4]) if air_date and len(air_date) >= 4 else year,
+                "title": r[name_key],
+                "year": int(date_str[:4]) if date_str and len(date_str) >= 4 else year,
                 "tmdb_id": r["id"],
             }
             if _cache is not None:
                 _cache[cache_key] = result
-            log.info(f"  TMDb API → {title} = {result['title']} ({result['year']}) [tmdbid={result['tmdb_id']}]")
+            log.info(f"  TMDb API → {title} = {result['title']} "
+                     f"({result['year']}) [tmdbid={result['tmdb_id']}]")
             return result
     except Exception as e:
-        log.debug(f"TMDb TV search failed for '{title}': {e}")
+        log.debug(f"TMDb {media_type} search failed for '{title}': {e}")
     return None
 
 
-# ---------------------------------------------------------------------------
-# Name sanitisation & formatting
-# ---------------------------------------------------------------------------
-
-def sanitise(name: str) -> str:
-    """Remove characters that Jellyfin doesn't allow in filenames."""
-    name = UNSAFE_CHARS.sub("", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    name = name.rstrip(". ")
-    return name
+def tmdb_search_film(title: str, year: int | None = None,
+                     _cache: dict | None = None) -> dict | None:
+    """Search TMDb for a film. Returns {title, year, tmdb_id} or None."""
+    return _tmdb_search(title, year, "film", _cache)
 
 
-def format_film_name(title: str, year: int | None, tmdb_id: int | None = None) -> str:
-    """Format: Film Name (Year) [tmdbid=XXXXX]"""
-    title = sanitise(title)
-    parts = [title]
-    if year:
-        parts.append(f"({year})")
-    if tmdb_id:
-        parts.append(f"[tmdbid={tmdb_id}]")
-    return " ".join(parts)
-
-
-def format_show_name(title: str, year: int | None, tmdb_id: int | None = None) -> str:
-    """Format: Show Name (Year) [tmdbid=XXXXX]"""
-    title = sanitise(title)
-    parts = [title]
-    if year:
-        parts.append(f"({year})")
-    if tmdb_id:
-        parts.append(f"[tmdbid={tmdb_id}]")
-    return " ".join(parts)
-
-
-def format_episode(title: str, year: int | None, season: int, episode: int | list) -> str:
-    """Format: Show Name (Year) SXXEXX  (no tmdbid in episode filename)"""
-    base = sanitise(title)
-    if year:
-        base = f"{base} ({year})"
-    if isinstance(episode, list):
-        ep_str = "".join(f"E{e:02d}" for e in episode)
-    else:
-        ep_str = f"E{episode:02d}"
-    return f"{base} S{season:02d}{ep_str}"
-
-
-# ---------------------------------------------------------------------------
-# Symlink management
-# ---------------------------------------------------------------------------
-
-def create_symlink(source: Path, target: Path):
-    """Create a symlink at target pointing to source, creating parent dirs."""
-    try:
-        relative_to_zurg = source.relative_to(ZURG_MOUNT)
-        symlink_target = JELLYFIN_ZURG_PATH / relative_to_zurg
-    except ValueError:
-        symlink_target = source
-
-    if target.exists() or target.is_symlink():
-        if target.is_symlink() and os.readlink(target) == str(symlink_target):
-            return
-        target.unlink()
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.symlink_to(symlink_target)
-    log.info(f"  ✓ {target.relative_to(MEDIA_DIR)} → {symlink_target}")
-
-
-def cleanup_broken_symlinks(directory: Path):
-    """Remove symlinks whose target no longer exists, then prune empty dirs."""
-    if not directory.exists():
-        return
-
-    removed = 0
-    for item in directory.rglob("*"):
-        if item.is_symlink() and not item.resolve().exists():
-            log.info(f"  ✗ Removing broken symlink: {item.relative_to(MEDIA_DIR)}")
-            item.unlink()
-            removed += 1
-
-    if removed:
-        log.info(f"  Cleaned up {removed} broken symlink(s)")
-
-    # Prune empty directories (bottom-up)
-    for dirpath in sorted(directory.rglob("*"), reverse=True):
-        if dirpath.is_dir() and not any(dirpath.iterdir()):
-            dirpath.rmdir()
-            log.debug(f"  Removed empty dir: {dirpath}")
+def tmdb_search_tv(title: str, year: int | None = None,
+                   _cache: dict | None = None) -> dict | None:
+    """Search TMDb for a TV show. Returns {title, year, tmdb_id} or None."""
+    return _tmdb_search(title, year, "show", _cache)
 
 
 # ---------------------------------------------------------------------------
 # Phase A — Sync torrent records with zurg mount
 # ---------------------------------------------------------------------------
-
-def _get_torrent_path(folder_name: str) -> str:
-    """Compute the canonical torrent path from a folder name."""
-    return str(ZURG_MOUNT / folder_name)
-
-
-def _torrent_has_media(torrent_id: str) -> bool:
-    """Check if a torrent has any associated films or shows in PocketBase."""
-    films = pb.list_films_by_torrent(torrent_id)
-    if films:
-        return True
-    shows = pb.list_shows_by_torrent(torrent_id)
-    if shows:
-        return True
-    return False
-
 
 def _build_rd_lookup(
     rd_client: RealDebridClient | None,
@@ -999,20 +334,6 @@ def _build_rd_lookup(
     Returns (primary, reverse) where:
       primary  = {rd_filename → {hash, rd_id, rd_filename}}
       reverse  = {internal_basename → {hash, rd_id, rd_filename}}
-
-    rd_filename is the best available name for identification — preferring
-    ``original_filename`` (the actual torrent name) over ``filename`` when
-    the latter is meaningless (e.g. ``00000.m2ts``).
-
-    The ``/torrents/info`` endpoint is called lazily for two cases:
-      1. Torrents whose ``filename`` looks meaningless — to fetch
-         ``original_filename`` (the real torrent name).
-      2. Torrents whose ``filename`` doesn't match any Zurg entry — to
-         build a reverse index from internal file basenames.
-    This avoids burning the ``/torrents/info`` rate-limit for the
-    common case where everything already matches cleanly.
-
-    Called once per scan cycle.
     """
     empty: tuple[dict[str, dict], dict[str, dict]] = ({}, {})
     if rd_client is None:
@@ -1020,7 +341,6 @@ def _build_rd_lookup(
 
     primary: dict[str, dict] = {}
     reverse: dict[str, dict] = {}
-    # Torrents that need a /torrents/info call (meaningless name or unmatched)
     needs_info: list[dict] = []
 
     try:
@@ -1030,7 +350,6 @@ def _build_rd_lookup(
             if not filename:
                 continue
 
-            title_stem = Path(filename).stem
             meta = {
                 "hash": t.get("hash", ""),
                 "rd_id": t.get("id", ""),
@@ -1038,47 +357,37 @@ def _build_rd_lookup(
             }
             primary[filename] = meta
 
-            # Queue for /torrents/info if:
-            # (a) the filename is meaningless → need original_filename, OR
-            # (b) the filename doesn't match any Zurg entry → need file list for reverse index
-            is_meaningless = _is_meaningless_title(title_stem)
+            title_stem = Path(filename).stem
+            is_meaningless = is_meaningless_title(title_stem)
             is_unmatched = torrent_entries is not None and filename not in torrent_entries
-
             if is_meaningless or is_unmatched:
                 needs_info.append(meta)
 
         log.info(f"  RD API: fetched {len(primary)} torrent(s) for hash hydration")
     except Exception as e:
-        log.warning(f"  RD API: failed to list torrents for hash hydration: {e}")
+        log.warning(f"  RD API: failed to list torrents: {e}")
         return empty
 
-    # Enrich with /torrents/info for torrents that need it
     if needs_info:
         log.info(f"  RD API: enriching {len(needs_info)} torrent(s) via /torrents/info...")
         for meta in needs_info:
-            rd_id = meta["rd_id"]
             try:
-                info = rd_client.get_torrent_info(rd_id)
+                info = rd_client.get_torrent_info(meta["rd_id"])
                 if not info:
                     continue
-
-                # Upgrade rd_filename to original_filename if available
                 orig = info.get("original_filename", "")
                 if orig and orig != meta["rd_filename"]:
                     log.info(f"  RD API: original_filename for "
                              f"{meta['rd_filename']!r} → {orig!r}")
                     meta["rd_filename"] = orig
-
-                # Build reverse index from internal file paths
                 for f in info.get("files", []):
                     fpath = f.get("path", "")
-                    if not fpath:
-                        continue
-                    basename = Path(fpath).name
-                    if basename and basename not in reverse:
-                        reverse[basename] = meta
+                    if fpath:
+                        basename = Path(fpath).name
+                        if basename and basename not in reverse:
+                            reverse[basename] = meta
             except Exception as e:
-                log.debug(f"  RD API: failed to get info for {rd_id}: {e}")
+                log.debug(f"  RD API: failed to get info for {meta['rd_id']}: {e}")
 
         if reverse:
             log.info(f"  RD API: reverse index has {len(reverse)} file-name mapping(s)")
@@ -1090,33 +399,25 @@ def phase_a_sync_torrents(torrent_entries: dict[str, list[Path]],
                           rd_client: RealDebridClient | None = None) -> list[tuple[str, dict]]:
     """Sync zurg mount entries with PocketBase torrents.
 
-    Returns a list of (folder_name, torrent_record) pairs that need identification.
-    Also hydrates hash/rd_id from the RD API when available.
+    Returns a list of (folder_name, torrent_record) pairs needing identification.
     """
     needs_identification: list[tuple[str, dict]] = []
-
-    # Build RD lookups once per cycle
     rd_primary, rd_reverse = _build_rd_lookup(rd_client, torrent_entries)
 
     for folder_name, video_files in torrent_entries.items():
-        torrent_path = _get_torrent_path(folder_name)
+        torrent_path = str(ZURG_MOUNT / folder_name)
         existing = pb.get_torrent_by_path(torrent_path)
 
-        # Resolve RD metadata — try primary (by RD filename), then reverse
-        # (by internal file basename) for loose-file torrents.
-        rd_meta = rd_primary.get(folder_name, {})
-        if not rd_meta:
-            rd_meta = rd_reverse.get(folder_name, {})
-            if rd_meta:
-                log.info(f"  RD reverse match: {folder_name} → {rd_meta.get('rd_filename', '?')}")
+        # Resolve RD metadata
+        rd_meta = rd_primary.get(folder_name) or rd_reverse.get(folder_name, {})
+        if not rd_primary.get(folder_name) and rd_meta:
+            log.info(f"  RD reverse match: {folder_name} → {rd_meta.get('rd_filename', '?')}")
 
         rd_hash = rd_meta.get("hash", "")
         rd_id = rd_meta.get("rd_id", "")
         rd_filename = rd_meta.get("rd_filename", "")
 
         if existing is None:
-            # New torrent — create record and queue for identification
-            # Use rd_filename for quality scoring if available and better
             score_name = rd_filename if rd_filename else folder_name
             score = score_quality(score_name)
             torrent = pb.create_torrent(
@@ -1128,8 +429,7 @@ def phase_a_sync_torrents(torrent_entries: dict[str, list[Path]],
                 needs_identification.append((folder_name, torrent))
             continue
 
-        # Existing torrent — hydrate hash/rd_id/rd_filename if missing or changed,
-        # and reset repair_attempts if torrent is back on the mount
+        # Hydrate hash/rd_id/rd_filename if changed
         updates: dict = {}
         if rd_hash and existing.get("hash") != rd_hash:
             updates["hash"] = rd_hash
@@ -1137,31 +437,22 @@ def phase_a_sync_torrents(torrent_entries: dict[str, list[Path]],
             updates["rd_id"] = rd_id
         if rd_filename and existing.get("rd_filename") != rd_filename:
             updates["rd_filename"] = rd_filename
-            # Recompute quality score from rd_filename if it's better
             new_score = score_quality(rd_filename)
             if new_score > existing.get("score", 0):
                 updates["score"] = new_score
         if existing.get("repair_attempts", 0) > 0:
-            # Torrent path exists on mount → repair succeeded, reset counter
             updates["repair_attempts"] = 0
         if updates:
             pb.update_torrent(existing["id"], **updates)
             existing.update(updates)
 
-        if existing.get("archived"):
-            # Archived — skip
+        if existing.get("archived") or existing.get("manual"):
             continue
 
-        if existing.get("manual"):
-            # Awaiting manual resolution — skip
+        # Check if already has media
+        if pb.list_films_by_torrent(existing["id"]) or pb.list_shows_by_torrent(existing["id"]):
             continue
 
-        # Active torrent — check if it already has media linked
-        if _torrent_has_media(existing["id"]):
-            # Already indexed — skip
-            continue
-
-        # Has a record but no media — needs identification
         needs_identification.append((folder_name, existing))
 
     return needs_identification
@@ -1173,20 +464,15 @@ def phase_a_sync_torrents(torrent_entries: dict[str, list[Path]],
 
 def _identify_film(folder_name: str, torrent: dict,
                    tmdb_cache: dict) -> bool:
-    """Try to identify a torrent as a film and handle duplicate resolution.
-
-    Returns True if identified, False otherwise.
-    Falls back to the RD torrent filename when the Zurg entry name is
-    too generic (e.g. '00000.m2ts').
-    """
+    """Try to identify a torrent as a film. Returns True if identified."""
     guess = guessit(folder_name, {"type": "movie"})
     title = guess.get("title", folder_name)
     year = validate_year(guess.get("year"), folder_name)
 
     tmdb = tmdb_search_film(title, year, _cache=tmdb_cache)
 
-    # Fallback: if the primary name yielded nothing useful, try rd_filename
-    if not tmdb and _is_meaningless_title(title):
+    # Fallback: try rd_filename if primary name is meaningless
+    if not tmdb and is_meaningless_title(title):
         rd_fn = torrent.get("rd_filename", "")
         if rd_fn:
             log.info(f"  Fallback to RD filename for film: {rd_fn}")
@@ -1198,65 +484,28 @@ def _identify_film(folder_name: str, torrent: dict,
     if not tmdb:
         return False
 
-    title = tmdb["title"]
-    year = tmdb.get("year", year)
-    tmdb_id = tmdb["tmdb_id"]
-    torrent_id = torrent["id"]
-    torrent_score = torrent.get("score", 0)
-
-    # Check if this film already exists
-    existing_film = pb.get_film_by_tmdb(tmdb_id)
-
-    if existing_film:
-        # Film exists — compare scores
-        existing_torrent_id = existing_film.get("torrent")
-        if not existing_torrent_id:
-            # Existing film has no torrent (was removed) — take it over
-            pb.update_film(existing_film["id"], torrent=torrent_id)
-            log.info(f"  Film: {title} ({year}) — re-linked to torrent {folder_name}")
-            return True
-
-        # Get the existing torrent's score
-        existing_torrent = (existing_film.get("expand") or {}).get("torrent")
-        if not existing_torrent:
-            existing_torrent = pb.get_torrent_by_id(existing_torrent_id)
-        existing_score = existing_torrent.get("score", 0) if existing_torrent else 0
-
-        if torrent_score > existing_score:
-            # New torrent wins — swap
-            pb.update_film(existing_film["id"], torrent=torrent_id)
-            pb.update_torrent(existing_torrent_id, archived=True)
-            log.info(f"  Film: {title} ({year}) — new torrent wins "
-                     f"({format_score(torrent_score)} > {format_score(existing_score)})")
-        else:
-            # Existing torrent wins — archive the new one
-            pb.update_torrent(torrent_id, archived=True)
-            log.info(f"  Film: {title} ({year}) — existing torrent wins "
-                     f"({format_score(existing_score)} >= {format_score(torrent_score)}), archiving new")
-    else:
-        # New film — create it
-        pb.create_film(torrent_id=torrent_id, tmdb_id=tmdb_id, title=title, year=year)
-        log.info(f"  Film: {title} ({year}) [tmdbid={tmdb_id}]  {format_score(torrent_score)}")
-
+    resolve_film_duplicate(
+        pb,
+        torrent_id=torrent["id"],
+        torrent_score=torrent.get("score", 0),
+        tmdb_id=tmdb["tmdb_id"],
+        title=tmdb["title"],
+        year=tmdb.get("year", year),
+    )
     return True
 
 
 def _identify_show(folder_name: str, video_files: list[Path],
                    torrent: dict, tmdb_cache: dict,
                    folder_cache: dict) -> bool:
-    """Try to identify a torrent as a show and handle duplicate resolution.
-
-    Returns True if identified, False otherwise.
-    """
+    """Try to identify a torrent as a show. Returns True if identified."""
     torrent_id = torrent["id"]
     torrent_score = torrent.get("score", 0)
 
-    # Resolve show identity — use folder cache to ensure consistency
+    # Resolve show identity via folder cache
     if folder_name in folder_cache:
         cached = folder_cache[folder_name]
-        title = cached["title"]
-        year = cached.get("year")
-        tmdb_id = cached.get("tmdb_id")
+        title, year, tmdb_id = cached["title"], cached.get("year"), cached.get("tmdb_id")
     else:
         folder_guess = guessit(folder_name, {"type": "episode"})
         title = folder_guess.get("title", folder_name)
@@ -1264,8 +513,7 @@ def _identify_show(folder_name: str, video_files: list[Path],
 
         tmdb = tmdb_search_tv(title, year, _cache=tmdb_cache)
 
-        # Fallback: if the primary name yielded nothing, try rd_filename
-        if not tmdb and _is_meaningless_title(title):
+        if not tmdb and is_meaningless_title(title):
             rd_fn = torrent.get("rd_filename", "")
             if rd_fn:
                 log.info(f"  Fallback to RD filename for show: {rd_fn}")
@@ -1275,164 +523,78 @@ def _identify_show(folder_name: str, video_files: list[Path],
                 tmdb = tmdb_search_tv(title, year, _cache=tmdb_cache)
 
         if tmdb:
-            title = tmdb["title"]
-            year = tmdb.get("year", year)
-            tmdb_id = tmdb["tmdb_id"]
+            title, year, tmdb_id = tmdb["title"], tmdb.get("year", year), tmdb["tmdb_id"]
         else:
             tmdb_id = None
 
-        folder_cache[folder_name] = {
-            "title": title,
-            "year": year,
-            "tmdb_id": tmdb_id,
-        }
+        folder_cache[folder_name] = {"title": title, "year": year, "tmdb_id": tmdb_id}
 
     if tmdb_id is None:
         return False
 
-    # Fetch the full TMDB season/episode structure for this show
     tmdb_structure = tmdb_get_show_structure(tmdb_id, TMDB_API_KEY, TMDB_BASE)
 
-    # Process each video file as a potential episode
-    any_episode_found = False
-    all_episodes_lost = True  # track if this torrent loses every episode
+    any_found = False
+    all_lost = True
 
     for video_path in video_files:
         file_guess = guessit(video_path.name, {"type": "episode"})
         guessit_season = file_guess.get("season")
         guessit_episode = file_guess.get("episode")
 
-        # Try parent directory for season if guessit didn't find one
         if guessit_season is None:
             torrent_root = Path(torrent.get("path", ""))
-            guessit_season = _extract_season_from_path(video_path, torrent_root)
+            guessit_season = extract_season_from_path(video_path, torrent_root)
 
-        # --- Primary: TMDB structure matching ---
-        matched_episodes: list[tuple[int, int]] | None = None
+        # Primary: TMDB structure matching
+        matched_episodes = None
         if tmdb_structure:
             matched_episodes = match_file_to_tmdb_episode(
                 video_path.name, guessit_season, guessit_episode, tmdb_structure,
             )
 
         if matched_episodes:
-            # TMDB matched — use those (season, episode) tuples directly
             for season, ep_num in matched_episodes:
-                any_episode_found = True
-                existing = pb.get_show_episode(tmdb_id, season, ep_num)
+                any_found = True
+                result = resolve_episode_duplicate(
+                    pb, torrent_id, torrent_score,
+                    tmdb_id, title, year, season, ep_num,
+                )
+                if result != "lost":
+                    all_lost = False
+            continue
 
-                if existing:
-                    # Episode exists — compare scores
-                    existing_torrent_id = existing.get("torrent")
-                    if not existing_torrent_id:
-                        # No torrent linked — take it over
-                        pb.update_show(existing["id"], torrent=torrent_id)
-                        all_episodes_lost = False
-                        log.info(f"  Show: {title} S{season:02d}E{ep_num:02d} — re-linked")
-                        continue
-
-                    existing_torrent = (existing.get("expand") or {}).get("torrent")
-                    if not existing_torrent:
-                        existing_torrent = pb.get_torrent_by_id(existing_torrent_id)
-                    existing_score = existing_torrent.get("score", 0) if existing_torrent else 0
-
-                    if torrent_score > existing_score:
-                        # New torrent wins this episode
-                        pb.update_show(existing["id"], torrent=torrent_id)
-                        all_episodes_lost = False
-                        log.info(f"  Show: {title} S{season:02d}E{ep_num:02d} — new torrent wins "
-                                 f"({format_score(torrent_score)} > {format_score(existing_score)})")
-                        # Check if the old torrent still has any episodes
-                        _maybe_archive_torrent(existing_torrent_id)
-                    else:
-                        # Existing wins — this episode stays with old torrent
-                        log.info(f"  Show: {title} S{season:02d}E{ep_num:02d} — existing wins "
-                                 f"({format_score(existing_score)} >= {format_score(torrent_score)})")
-                else:
-                    # New episode — create it
-                    pb.create_show(
-                        torrent_id=torrent_id, tmdb_id=tmdb_id,
-                        title=title, year=year,
-                        season=season, episode=ep_num,
-                    )
-                    all_episodes_lost = False
-                    log.info(f"  Show: {title} S{season:02d}E{ep_num:02d} [tmdbid={tmdb_id}]")
-            continue  # TMDB match handled — skip fallback
-
-        # --- Fallback: guessit-only assignment (no TMDB match) ---
+        # Fallback: guessit-only
         season = guessit_season
         episode = guessit_episode
 
-        # Fall back to folder name, then default to 1
         if season is None:
-            folder_guess_ep = guessit(folder_name, {"type": "episode"})
-            season = folder_guess_ep.get("season", 1)
+            fg_folder = guessit(folder_name, {"type": "episode"})
+            season = fg_folder.get("season", 1)
 
         if episode is None:
             log.warning(f"  Skipping (no episode detected): {video_path.name}")
             continue
 
-        # Handle multi-episode files (e.g. S01E01E02)
         episodes = episode if isinstance(episode, list) else [episode]
-
         for ep_num in episodes:
-            any_episode_found = True
-            existing = pb.get_show_episode(tmdb_id, season, ep_num)
+            any_found = True
+            result = resolve_episode_duplicate(
+                pb, torrent_id, torrent_score,
+                tmdb_id, title, year, season, ep_num,
+                label=" (fallback)",
+            )
+            if result != "lost":
+                all_lost = False
 
-            if existing:
-                existing_torrent_id = existing.get("torrent")
-                if not existing_torrent_id:
-                    pb.update_show(existing["id"], torrent=torrent_id)
-                    all_episodes_lost = False
-                    log.info(f"  Show: {title} S{season:02d}E{ep_num:02d} — re-linked (fallback)")
-                    continue
-
-                existing_torrent = (existing.get("expand") or {}).get("torrent")
-                if not existing_torrent:
-                    existing_torrent = pb.get_torrent_by_id(existing_torrent_id)
-                existing_score = existing_torrent.get("score", 0) if existing_torrent else 0
-
-                if torrent_score > existing_score:
-                    pb.update_show(existing["id"], torrent=torrent_id)
-                    all_episodes_lost = False
-                    log.info(f"  Show: {title} S{season:02d}E{ep_num:02d} — new torrent wins "
-                             f"({format_score(torrent_score)} > {format_score(existing_score)}) (fallback)")
-                    _maybe_archive_torrent(existing_torrent_id)
-                else:
-                    log.info(f"  Show: {title} S{season:02d}E{ep_num:02d} — existing wins "
-                             f"({format_score(existing_score)} >= {format_score(torrent_score)}) (fallback)")
-            else:
-                pb.create_show(
-                    torrent_id=torrent_id, tmdb_id=tmdb_id,
-                    title=title, year=year,
-                    season=season, episode=ep_num,
-                )
-                all_episodes_lost = False
-                log.info(f"  Show: {title} S{season:02d}E{ep_num:02d} [tmdbid={tmdb_id}] (fallback)")
-
-    if not any_episode_found:
+    if not any_found:
         return False
 
-    # If this torrent lost every episode contest, archive it
-    if all_episodes_lost:
+    if all_lost:
         pb.update_torrent(torrent_id, archived=True)
         log.info(f"  Torrent archived (all episodes superseded): {folder_name}")
 
     return True
-
-
-def _maybe_archive_torrent(torrent_id: str):
-    """Archive a torrent if it no longer provides any episodes or films."""
-    films = pb.list_films_by_torrent(torrent_id)
-    if films:
-        return
-    shows = pb.list_shows_by_torrent(torrent_id)
-    if shows:
-        return
-    # No media linked — archive it
-    pb.update_torrent(torrent_id, archived=True)
-    torrent = pb.get_torrent_by_id(torrent_id)
-    name = torrent.get("name", torrent_id) if torrent else torrent_id
-    log.info(f"  Torrent archived (no media remaining): {name}")
 
 
 def phase_b_identify(needs_identification: list[tuple[str, dict]],
@@ -1444,10 +606,9 @@ def phase_b_identify(needs_identification: list[tuple[str, dict]],
 
     log.info(f"Identifying {len(needs_identification)} torrent(s)...")
 
-    # In-memory caches for this scan cycle
-    tmdb_film_cache: dict[str, dict] = {}
-    tmdb_tv_cache: dict[str, dict] = {}
-    folder_cache: dict[str, dict] = {}
+    tmdb_film_cache: dict = {}
+    tmdb_tv_cache: dict = {}
+    folder_cache: dict = {}
 
     for folder_name, torrent in needs_identification:
         video_files = torrent_entries.get(folder_name, [])
@@ -1457,22 +618,19 @@ def phase_b_identify(needs_identification: list[tuple[str, dict]],
             identified = _identify_film(folder_name, torrent, tmdb_film_cache)
         else:
             identified = _identify_show(
-                folder_name, video_files, torrent,
-                tmdb_tv_cache, folder_cache,
+                folder_name, video_files, torrent, tmdb_tv_cache, folder_cache,
             )
 
         if not identified:
-            # Could not identify — try the other type as fallback
+            # Try the other type as fallback
             if media_type == "film":
                 identified = _identify_show(
-                    folder_name, video_files, torrent,
-                    tmdb_tv_cache, folder_cache,
+                    folder_name, video_files, torrent, tmdb_tv_cache, folder_cache,
                 )
             else:
                 identified = _identify_film(folder_name, torrent, tmdb_film_cache)
 
         if not identified:
-            # Still can't identify — mark for manual resolution
             pb.update_torrent(torrent["id"], manual=True)
             log.warning(f"  ✗ Could not identify: {folder_name} — marked for manual resolution")
 
@@ -1482,11 +640,7 @@ def phase_b_identify(needs_identification: list[tuple[str, dict]],
 # ---------------------------------------------------------------------------
 
 def _attempt_repair(torrent: dict, rd_client: RealDebridClient) -> bool:
-    """Try to re-add a dead torrent to Real-Debrid via its cached hash.
-
-    Returns True if the magnet was successfully re-added and files selected.
-    The torrent will reappear on the Zurg mount within ~10s (Zurg polls RD).
-    """
+    """Try to re-add a dead torrent to Real-Debrid via its cached hash."""
     torrent_hash = torrent.get("hash", "")
     name = torrent.get("name", torrent.get("id", "?"))
     old_rd_id = torrent.get("rd_id", "")
@@ -1496,90 +650,62 @@ def _attempt_repair(torrent: dict, rd_client: RealDebridClient) -> bool:
         return False
 
     try:
-        # Step 1: Re-add the magnet
         new_id = rd_client.add_magnet(torrent_hash)
         if not new_id:
             log.warning(f"  Repair failed (addMagnet returned nothing): {name}")
             return False
 
-        # Step 2: Select video files on the new torrent
-        selected = rd_client.select_video_files(new_id)
-        if not selected:
-            log.warning(f"  Repair partial (no files selected): {name}")
-            # Still counts as a repair attempt — the torrent was added
+        rd_client.select_video_files(new_id)
 
-        # Step 3: Delete the old dead torrent entry (best-effort)
         if old_rd_id and old_rd_id != new_id:
             rd_client.delete_torrent(old_rd_id)
 
         return True
-
     except Exception as e:
         log.warning(f"  Repair failed for {name}: {e}")
         return False
 
 
 def phase_c_detect_removed(rd_client: RealDebridClient | None = None):
-    """Detect torrents removed from zurg and attempt repair or clean up.
-
-    When repair is enabled and a torrent has a cached hash:
-      1. Try to re-add the torrent to RD via its info-hash
-      2. If successful, keep the PocketBase record (Zurg will pick it up)
-      3. If failed or max attempts exceeded, orphan media and delete record
-    """
+    """Detect torrents removed from zurg and attempt repair or clean up."""
     all_torrents = pb.list_all_torrents()
     removed_count = 0
     repaired_count = 0
 
     for torrent in all_torrents:
         torrent_path = torrent.get("path", "")
-        if not torrent_path:
-            continue
-
-        path = Path(torrent_path)
-        if path.exists():
+        if not torrent_path or Path(torrent_path).exists():
             continue
 
         torrent_id = torrent["id"]
         name = torrent.get("name", torrent_id)
         repair_attempts = torrent.get("repair_attempts", 0)
 
-        # --- Try repair first ---
-        if (REPAIR_ENABLED
-                and rd_client is not None
+        # Try repair first
+        if (REPAIR_ENABLED and rd_client is not None
                 and torrent.get("hash")
                 and repair_attempts < MAX_REPAIR_ATTEMPTS):
-
             log.info(f"  Attempting repair ({repair_attempts + 1}/{MAX_REPAIR_ATTEMPTS}): {name}")
             success = _attempt_repair(torrent, rd_client)
-
-            # Always increment repair_attempts
             pb.update_torrent(torrent_id, repair_attempts=repair_attempts + 1)
 
             if success:
                 log.info(f"  ✓ Repaired torrent: {name} — waiting for Zurg to pick it up")
                 repaired_count += 1
-                continue  # Don't orphan — wait for Zurg to re-mount
-            else:
-                log.warning(f"  ✗ Repair failed for: {name}")
-                # Fall through to orphan logic only if max attempts now reached
-                if repair_attempts + 1 < MAX_REPAIR_ATTEMPTS:
-                    continue  # Still have retries left
+                continue
+            elif repair_attempts + 1 < MAX_REPAIR_ATTEMPTS:
+                continue
 
-        # --- Orphan and delete (repair disabled, no hash, or max attempts) ---
-
-        # Null out torrent relation on films
+        # Orphan and delete
         for film in pb.list_films_by_torrent(torrent_id):
             pb.update_film(film["id"], torrent="")
             log.info(f"  Film orphaned (torrent removed): {film.get('title', '?')}")
 
-        # Null out torrent relation on shows
         for show in pb.list_shows_by_torrent(torrent_id):
             pb.update_show(show["id"], torrent="")
             log.info(f"  Show orphaned (torrent removed): "
                      f"{show.get('title', '?')} S{show.get('season', 0):02d}E{show.get('episode', 0):02d}")
 
-        # Delete the torrent record
         pb.delete_torrent(torrent_id)
         log.info(f"  ✗ Torrent removed from RD: {name}")
         removed_count += 1
@@ -1594,48 +720,19 @@ def phase_c_detect_removed(rd_client: RealDebridClient | None = None):
 # Phase D — Build symlinks from PocketBase state
 # ---------------------------------------------------------------------------
 
-def _get_video_files_for_torrent(torrent: dict) -> list[Path]:
-    """Get video files from a torrent's path on the zurg mount."""
-    torrent_path = Path(torrent.get("path", ""))
-    if not torrent_path.exists():
-        return []
-
-    if torrent_path.is_file():
-        # Loose file
-        if torrent_path.suffix.lower() in VIDEO_EXTENSIONS:
-            return [torrent_path]
-        return []
-
-    # Directory — find all video files
-    video_files = []
-    try:
-        for item in torrent_path.rglob("*"):
-            if item.is_file() and item.suffix.lower() in VIDEO_EXTENSIONS:
-                video_files.append(item)
-    except OSError as e:
-        log.warning(f"Error scanning {torrent_path}: {e}")
-
-    return video_files
-
-
 def _find_best_video_file(video_files: list[Path]) -> Path | None:
     """Pick the main video file from a list (largest file = main feature)."""
     if not video_files:
         return None
     if len(video_files) == 1:
         return video_files[0]
-    # Pick the largest file
     return max(video_files, key=lambda f: f.stat().st_size)
 
 
 def _match_episode_file(video_files: list[Path], season: int,
                         episode: int, torrent_path: str = "",
                         tmdb_structure: ShowStructure | None = None) -> Path | None:
-    """Find the video file matching a specific season/episode.
-
-    Uses TMDB structure matching (if available) before falling back to
-    guessit + path-based season extraction.
-    """
+    """Find the video file matching a specific season/episode."""
     torrent_root = Path(torrent_path) if torrent_path else None
 
     for vf in video_files:
@@ -1643,36 +740,38 @@ def _match_episode_file(video_files: list[Path], season: int,
         file_season = fg.get("season")
         file_episode = fg.get("episode")
 
-        # Try parent directory for season if not in filename
         if file_season is None and torrent_root:
-            file_season = _extract_season_from_path(vf, torrent_root)
+            file_season = extract_season_from_path(vf, torrent_root)
 
-        # --- Primary: TMDB structure matching ---
         if tmdb_structure:
             matched = match_file_to_tmdb_episode(
                 vf.name, file_season, file_episode, tmdb_structure,
             )
             if matched and (season, episode) in matched:
                 return vf
-            # If TMDB matched to a *different* episode, skip this file
             if matched:
                 continue
 
-        # --- Fallback: guessit-only matching ---
         if file_episode is None:
             continue
-
         file_episodes = file_episode if isinstance(file_episode, list) else [file_episode]
-
-        if episode in file_episodes:
-            if file_season is None or file_season == season:
-                return vf
+        if episode in file_episodes and (file_season is None or file_season == season):
+            return vf
 
     return None
 
 
+def _resolve_symlink_target(source: Path) -> str:
+    """Compute the symlink target string for a source file."""
+    try:
+        relative_to_zurg = source.relative_to(ZURG_MOUNT)
+        return str(JELLYFIN_ZURG_PATH / relative_to_zurg)
+    except ValueError:
+        return str(source)
+
+
 def _collect_existing_symlinks(directory: Path) -> dict[Path, str]:
-    """Scan a media directory and return {symlink_path: link_target} for all symlinks."""
+    """Scan a media directory and return {symlink_path: link_target}."""
     existing: dict[Path, str] = {}
     if not directory.exists():
         return existing
@@ -1691,41 +790,22 @@ def _prune_empty_dirs(directory: Path):
             dirpath.rmdir()
 
 
-def _resolve_symlink_target(source: Path) -> str:
-    """Compute what the symlink target string should be for a given source file."""
-    try:
-        relative_to_zurg = source.relative_to(ZURG_MOUNT)
-        return str(JELLYFIN_ZURG_PATH / relative_to_zurg)
-    except ValueError:
-        return str(source)
-
-
-def phase_d_build_symlinks():
-    """Incrementally sync symlinks from PocketBase state.
-
-    Computes the desired symlink map, diffs against what's on disk,
-    and only creates, updates, or removes what has changed.
-    This avoids disrupting active streams.
-    """
-    log.info("Syncing symlinks...")
-
-    # --- Build the desired state: {target_path: link_target_string} ---
+def _compute_desired_state() -> dict[Path, str]:
+    """Build the desired symlink map from PocketBase state."""
     desired: dict[Path, str] = {}
 
     # Films
-    all_films = pb.list_all_films()
-    for film in all_films:
+    for film in pb.list_all_films():
         torrent_id = film.get("torrent")
         if not torrent_id:
             continue
-
         torrent = (film.get("expand") or {}).get("torrent")
         if not torrent:
             torrent = pb.get_torrent_by_id(torrent_id)
         if not torrent:
             continue
 
-        video_files = _get_video_files_for_torrent(torrent)
+        video_files = get_video_files(torrent.get("path", ""))
         main_file = _find_best_video_file(video_files)
         if not main_file:
             continue
@@ -1734,20 +814,18 @@ def phase_d_build_symlinks():
         year = film.get("year") or None
         tmdb_id = film.get("tmdb_id")
 
-        film_name = format_film_name(title, year, tmdb_id)
-        target_path = FILMS_DIR / film_name / f"{film_name}{main_file.suffix}"
+        name = format_media_name(title, year, tmdb_id)
+        target_path = FILMS_DIR / name / f"{name}{main_file.suffix}"
         desired[target_path] = _resolve_symlink_target(main_file)
 
     # Shows
-    all_shows = pb.list_all_shows()
     torrent_files_cache: dict[str, list[Path]] = {}
     tmdb_structure_cache: dict[int, ShowStructure | None] = {}
 
-    for show in all_shows:
+    for show in pb.list_all_shows():
         torrent_id = show.get("torrent")
         if not torrent_id:
             continue
-
         torrent = (show.get("expand") or {}).get("torrent")
         if not torrent:
             torrent = pb.get_torrent_by_id(torrent_id)
@@ -1755,13 +833,12 @@ def phase_d_build_symlinks():
             continue
 
         if torrent_id not in torrent_files_cache:
-            torrent_files_cache[torrent_id] = _get_video_files_for_torrent(torrent)
+            torrent_files_cache[torrent_id] = get_video_files(torrent.get("path", ""))
         video_files = torrent_files_cache[torrent_id]
 
         season = show.get("season", 1)
         episode = show.get("episode", 1)
 
-        # Fetch TMDB structure for this show (cached)
         show_tmdb_id = show.get("tmdb_id")
         tmdb_struct = None
         if show_tmdb_id:
@@ -1771,9 +848,10 @@ def phase_d_build_symlinks():
                 )
             tmdb_struct = tmdb_structure_cache[show_tmdb_id]
 
-        matched_file = _match_episode_file(video_files, season, episode,
-                                             torrent.get("path", ""),
-                                             tmdb_structure=tmdb_struct)
+        matched_file = _match_episode_file(
+            video_files, season, episode,
+            torrent.get("path", ""), tmdb_structure=tmdb_struct,
+        )
         if not matched_file:
             continue
 
@@ -1781,64 +859,66 @@ def phase_d_build_symlinks():
         year = show.get("year") or None
         tmdb_id = show.get("tmdb_id")
 
-        show_name = format_show_name(title, year, tmdb_id)
+        show_name = format_media_name(title, year, tmdb_id)
         season_dir = SHOWS_DIR / show_name / f"Season {season:02d}"
         episode_name = format_episode(title, year, season, episode)
         target_path = season_dir / f"{episode_name}{matched_file.suffix}"
         desired[target_path] = _resolve_symlink_target(matched_file)
 
-    # --- Diff against what's on disk ---
-    existing_films = _collect_existing_symlinks(FILMS_DIR)
-    existing_shows = _collect_existing_symlinks(SHOWS_DIR)
-    on_disk = {**existing_films, **existing_shows}
+    return desired
 
-    created = 0
-    updated = 0
-    removed = 0
 
-    # Create or update symlinks that should exist
+def phase_d_build_symlinks() -> dict:
+    """Incrementally sync symlinks from PocketBase state.
+
+    Returns {"films_changed": bool, "shows_changed": bool}.
+    """
+    log.info("Syncing symlinks...")
+
+    desired = _compute_desired_state()
+
+    on_disk = {
+        **_collect_existing_symlinks(FILMS_DIR),
+        **_collect_existing_symlinks(SHOWS_DIR),
+    }
+
+    created = updated = removed = 0
+    films_changed = shows_changed = False
+
+    # Create or update
     for target_path, link_target in desired.items():
         if target_path in on_disk:
             if on_disk[target_path] == link_target:
-                continue  # Already correct — leave it alone
-            # Wrong target — update
+                continue
             target_path.unlink()
             target_path.symlink_to(link_target)
             log.info(f"  ↻ {target_path.relative_to(MEDIA_DIR)} → {link_target}")
             updated += 1
         else:
-            # New symlink
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.symlink_to(link_target)
             log.info(f"  ✓ {target_path.relative_to(MEDIA_DIR)} → {link_target}")
             created += 1
 
-    # Remove symlinks that shouldn't exist
+        # Track which libraries changed
+        if str(target_path).startswith(str(FILMS_DIR)):
+            films_changed = True
+        elif str(target_path).startswith(str(SHOWS_DIR)):
+            shows_changed = True
+
+    # Remove stale
     for target_path in on_disk:
         if target_path not in desired:
             target_path.unlink()
             log.info(f"  ✗ {target_path.relative_to(MEDIA_DIR)}")
             removed += 1
-
-    # Clean up empty directories
-    _prune_empty_dirs(FILMS_DIR)
-    _prune_empty_dirs(SHOWS_DIR)
-
-    films_changed = False
-    shows_changed = False
-    for target_path in desired:
-        if target_path in on_disk and on_disk[target_path] == desired[target_path]:
-            continue
-        if str(target_path).startswith(str(FILMS_DIR)):
-            films_changed = True
-        elif str(target_path).startswith(str(SHOWS_DIR)):
-            shows_changed = True
-    for target_path in on_disk:
-        if target_path not in desired:
             if str(target_path).startswith(str(FILMS_DIR)):
                 films_changed = True
             elif str(target_path).startswith(str(SHOWS_DIR)):
                 shows_changed = True
+
+    _prune_empty_dirs(FILMS_DIR)
+    _prune_empty_dirs(SHOWS_DIR)
 
     if created or updated or removed:
         log.info(f"  Symlinks: {created} created, {updated} updated, {removed} removed")
@@ -1848,12 +928,12 @@ def phase_d_build_symlinks():
     return {"films_changed": films_changed, "shows_changed": shows_changed}
 
 
-def phase_e_cleanup_archived(rd: RealDebridClient | None):
-    """Delete archived torrents from Real-Debrid and PocketBase.
+# ---------------------------------------------------------------------------
+# Phase E — Clean up archived torrents
+# ---------------------------------------------------------------------------
 
-    Archived torrents are duplicate losers — they have no linked media records
-    and serve no purpose. This phase removes them to free RD storage.
-    """
+def phase_e_cleanup_archived(rd: RealDebridClient | None):
+    """Delete archived torrents from Real-Debrid and PocketBase."""
     archived = pb.list_archived_torrents()
     if not archived:
         log.info("  No archived torrents to clean up")
@@ -1866,117 +946,14 @@ def phase_e_cleanup_archived(rd: RealDebridClient | None):
         name = torrent.get("name", torrent["id"])
         rd_id = torrent.get("rd_id", "")
 
-        # Delete from Real-Debrid if we have an RD ID and a client
         if rd and rd_id:
             rd.delete_torrent(rd_id)
 
-        # Delete from PocketBase
         pb.delete_torrent(torrent["id"])
-        log.info(f"  \U0001f5d1 {name}")
+        log.info(f"  🗑 {name}")
         deleted += 1
 
     log.info(f"  Cleaned up {deleted} archived torrent(s)")
-
-
-# ---------------------------------------------------------------------------
-# Jellyfin library refresh
-# ---------------------------------------------------------------------------
-
-
-def _trigger_jellyfin_refresh(films_changed: bool, shows_changed: bool):
-    """Trigger a per-library refresh in Jellyfin for libraries that changed."""
-    if not JELLYFIN_API_KEY:
-        log.debug("Jellyfin refresh skipped — JELLYFIN_API_KEY not set")
-        return
-    if not films_changed and not shows_changed:
-        return
-
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"'}
-    try:
-        resp = requests.get(
-            f"{JELLYFIN_URL}/Library/VirtualFolders",
-            headers=headers,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        libraries = resp.json()
-    except Exception as e:
-        log.warning(f"Failed to query Jellyfin libraries: {e}")
-        return
-
-    refreshed = []
-    for lib in libraries:
-        collection_type = (lib.get("CollectionType") or "").lower()
-        item_id = lib.get("ItemId")
-        name = lib.get("Name", "?")
-        if not item_id:
-            continue
-        if films_changed and collection_type == "movies":
-            pass  # fall through to refresh
-        elif shows_changed and collection_type == "tvshows":
-            pass  # fall through to refresh
-        else:
-            continue
-        try:
-            r = requests.post(
-                f"{JELLYFIN_URL}/Items/{item_id}/Refresh",
-                headers=headers,
-                params={"Recursive": "true", "MetadataRefreshMode": "Default",
-                        "ImageRefreshMode": "Default", "ReplaceAllMetadata": "false",
-                        "ReplaceAllImages": "false"},
-                timeout=10,
-            )
-            r.raise_for_status()
-            refreshed.append(name)
-        except Exception as e:
-            log.warning(f"Failed to refresh Jellyfin library '{name}': {e}")
-
-    if refreshed:
-        log.info(f"  Jellyfin refresh triggered: {', '.join(refreshed)}")
-
-
-# ---------------------------------------------------------------------------
-# Webhook server
-# ---------------------------------------------------------------------------
-
-# Event used to wake the scan loop early (set by webhook handler)
-_scan_event = threading.Event()
-
-
-class _WebhookHandler(BaseHTTPRequestHandler):
-    """Minimal HTTP handler — POST /trigger wakes the scan loop."""
-
-    def do_POST(self):
-        if self.path.rstrip("/") == "/trigger":
-            _scan_event.set()
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"status":"triggered"}\n')
-            log.info("Webhook trigger received — waking scan loop")
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_GET(self):
-        if self.path.rstrip("/") == "/health":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok"}\n')
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):  # noqa: A002
-        """Suppress default stderr logging — we use our own logger."""
-        pass
-
-
-def _start_webhook_server():
-    """Start the webhook HTTP server in a daemon thread."""
-    server = HTTPServer(("", WEBHOOK_PORT), _WebhookHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    log.info(f"Webhook server listening on port {WEBHOOK_PORT}")
 
 
 # ---------------------------------------------------------------------------
@@ -1986,56 +963,52 @@ def _start_webhook_server():
 # Global RD client — initialised in main() if API key is available
 rd_client: RealDebridClient | None = None
 
+# Webhook event
+_scan_event = threading.Event()
+
 
 def run_scan():
     """Run a single scan cycle through all phases."""
     log.info("Starting scan...")
 
-    # Scan the flat Zurg mount
     torrent_entries = _scan_zurg_mount()
     log.info(f"Found {len(torrent_entries)} torrent(s) on Zurg mount")
 
-    # Phase A — Sync torrent records
     log.info("Phase A: Syncing torrent records...")
     needs_identification = phase_a_sync_torrents(torrent_entries, rd_client)
 
-    # Phase B — Identify unidentified torrents
     log.info("Phase B: Identifying torrents...")
     phase_b_identify(needs_identification, torrent_entries)
 
-    # Phase C — Detect removed torrents (with auto-repair)
     log.info("Phase C: Detecting removed torrents...")
     phase_c_detect_removed(rd_client)
 
-    # Phase D — Build symlinks
     log.info("Phase D: Building symlinks...")
     changes = phase_d_build_symlinks()
 
-    # Trigger Jellyfin library refresh for any changed libraries
     if changes:
-        _trigger_jellyfin_refresh(changes["films_changed"], changes["shows_changed"])
+        jellyfin_mod.trigger_refresh(changes["films_changed"], changes["shows_changed"])
 
-    # Phase E — Clean up archived torrents
     if CLEANUP_ARCHIVED:
         log.info("Phase E: Cleaning up archived torrents...")
         phase_e_cleanup_archived(rd_client)
 
-    # Summary
-    all_torrents = pb.list_all_torrents()
-    all_films = pb.list_all_films()
-    all_shows = pb.list_all_shows()
-    active = sum(1 for t in all_torrents if not t.get("archived") and not t.get("manual"))
-    archived = sum(1 for t in all_torrents if t.get("archived"))
-    manual = sum(1 for t in all_torrents if t.get("manual"))
-    log.info(f"Scan complete. {len(all_torrents)} torrent(s) "
+    # Summary counts
+    all_t = pb.list_all_torrents()
+    active = sum(1 for t in all_t if not t.get("archived") and not t.get("manual"))
+    archived = sum(1 for t in all_t if t.get("archived"))
+    manual = sum(1 for t in all_t if t.get("manual"))
+    films = len(pb.list_all_films())
+    shows = len(pb.list_all_shows())
+    log.info(f"Scan complete. {len(all_t)} torrent(s) "
              f"({active} active, {archived} archived, {manual} manual), "
-             f"{len(all_films)} film(s), {len(all_shows)} episode(s)")
+             f"{films} film(s), {shows} episode(s)")
 
 
 def wait_for_pocketbase():
     """Wait for PocketBase to become available."""
     log.info(f"Waiting for PocketBase at {POCKETBASE_URL}...")
-    for attempt in range(60):
+    for _ in range(60):
         if pb.health_check():
             log.info("PocketBase is ready")
             return True
@@ -2059,7 +1032,6 @@ def main():
     log.info(f"  Jellyfin:       {'enabled' if JELLYFIN_API_KEY else 'disabled (set JELLYFIN_API_KEY)'}")
     log.info(f"  Webhook port:   {WEBHOOK_PORT}")
 
-    # Initialise RD client for auto-repair
     if REAL_DEBRID_API_KEY and REPAIR_ENABLED:
         rd_client = RealDebridClient(
             api_key=REAL_DEBRID_API_KEY,
@@ -2074,16 +1046,14 @@ def main():
 
     log.info("=" * 60)
 
-    # Ensure output directories exist
     FILMS_DIR.mkdir(parents=True, exist_ok=True)
     SHOWS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Wait for PocketBase
     wait_for_pocketbase()
 
-    # Wait for Zurg mount to become available
+    # Wait for Zurg mount
     log.info("Waiting for Zurg mount...")
-    for attempt in range(60):
+    for _ in range(60):
         if ZURG_MOUNT.exists() and any(ZURG_MOUNT.iterdir()):
             log.info("Zurg mount detected")
             break
@@ -2091,13 +1061,10 @@ def main():
     else:
         log.warning("Zurg mount not detected after 5 minutes, starting anyway")
 
-    # Start webhook server (receives triggers from Zurg)
-    _start_webhook_server()
+    webhook_mod.start_server(_scan_event, WEBHOOK_PORT)
 
-    # Initial scan
     run_scan()
 
-    # Continuous monitoring loop — interruptible by webhook trigger
     while True:
         log.info(f"Next scan in {SCAN_INTERVAL}s (or on webhook trigger)...")
         triggered = _scan_event.wait(timeout=SCAN_INTERVAL)
