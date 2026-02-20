@@ -29,12 +29,14 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TMDB_API_KEY=${TMDB_API_KEY:-}
-      - SCAN_INTERVAL_SECS=${SCAN_INTERVAL_SECS:-300}
+      - SCAN_INTERVAL_SECS=${SCAN_INTERVAL_SECS:-30}
       - POCKETBASE_URL=http://pocketbase:8090
       - REAL_DEBRID_API_KEY=${REAL_DEBRID_API_KEY:-}
       - REPAIR_ENABLED=${REPAIR_ENABLED:-true}
       - MAX_REPAIR_ATTEMPTS=${MAX_REPAIR_ATTEMPTS:-3}
       - MIN_VIDEO_FILE_SIZE_MB=${MIN_VIDEO_FILE_SIZE_MB:-100}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
+      - JELLYFIN_URL=http://jellyfin:8096
     volumes:
       - ${APPS}/rclone/config/rclone.conf:/rclone/rclone.conf:ro
       - ${MEDIA}:/media

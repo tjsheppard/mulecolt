@@ -15,6 +15,11 @@ rate_limit_sleep_secs: 6
 api_timeout_secs: 15
 # concurrent_workers: 20
 
+# Notify the organiser when new content appears on Real-Debrid.
+# This triggers an immediate scan instead of waiting for the next poll interval.
+on_library_update: |
+  wget -q --spider --post-data= http://organiser:8080/trigger 2>/dev/null || true
+
 # Repair — automatically re-resolves broken/expired download links
 enable_repair: true
 repair_every_mins: 60

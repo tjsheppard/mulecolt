@@ -28,13 +28,18 @@ Environment variables:
   REPAIR_ENABLED         — enable dead-torrent auto-repair (default: true)
   MAX_REPAIR_ATTEMPTS    — max repair retries per torrent (default: 3)
   MIN_VIDEO_FILE_SIZE_MB — minimum file size for repair file selection (default: 100)
+  JELLYFIN_API_KEY       — Jellyfin API key for triggering library refreshes
+  JELLYFIN_URL           — Jellyfin base URL (default: http://jellyfin:8096)
+  WEBHOOK_PORT           — port for the trigger webhook server (default: 8080)
 """
 
 import datetime
 import logging
 import os
 import re
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import requests
@@ -71,6 +76,13 @@ REAL_DEBRID_API_KEY = os.environ.get("REAL_DEBRID_API_KEY", "")
 REPAIR_ENABLED = os.environ.get("REPAIR_ENABLED", "true").lower() in ("true", "1", "yes")
 MAX_REPAIR_ATTEMPTS = int(os.environ.get("MAX_REPAIR_ATTEMPTS", "3"))
 MIN_VIDEO_FILE_SIZE_MB = int(os.environ.get("MIN_VIDEO_FILE_SIZE_MB", "100"))
+
+# Jellyfin library-refresh configuration
+JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://jellyfin:8096")
+JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
+
+# Webhook server port (receives triggers from Zurg on_library_update)
+WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "8080"))
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 
@@ -1637,10 +1649,129 @@ def phase_d_build_symlinks():
     _prune_empty_dirs(FILMS_DIR)
     _prune_empty_dirs(SHOWS_DIR)
 
+    films_changed = False
+    shows_changed = False
+    for target_path in desired:
+        if target_path in on_disk and on_disk[target_path] == desired[target_path]:
+            continue
+        if str(target_path).startswith(str(FILMS_DIR)):
+            films_changed = True
+        elif str(target_path).startswith(str(SHOWS_DIR)):
+            shows_changed = True
+    for target_path in on_disk:
+        if target_path not in desired:
+            if str(target_path).startswith(str(FILMS_DIR)):
+                films_changed = True
+            elif str(target_path).startswith(str(SHOWS_DIR)):
+                shows_changed = True
+
     if created or updated or removed:
         log.info(f"  Symlinks: {created} created, {updated} updated, {removed} removed")
     else:
         log.info("  Symlinks up to date — no changes")
+
+    return {"films_changed": films_changed, "shows_changed": shows_changed}
+
+
+# ---------------------------------------------------------------------------
+# Jellyfin library refresh
+# ---------------------------------------------------------------------------
+
+
+def _trigger_jellyfin_refresh(films_changed: bool, shows_changed: bool):
+    """Trigger a per-library refresh in Jellyfin for libraries that changed."""
+    if not JELLYFIN_API_KEY:
+        log.debug("Jellyfin refresh skipped — JELLYFIN_API_KEY not set")
+        return
+    if not films_changed and not shows_changed:
+        return
+
+    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"'}
+    try:
+        resp = requests.get(
+            f"{JELLYFIN_URL}/Library/VirtualFolders",
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        libraries = resp.json()
+    except Exception as e:
+        log.warning(f"Failed to query Jellyfin libraries: {e}")
+        return
+
+    refreshed = []
+    for lib in libraries:
+        collection_type = (lib.get("CollectionType") or "").lower()
+        item_id = lib.get("ItemId")
+        name = lib.get("Name", "?")
+        if not item_id:
+            continue
+        if films_changed and collection_type == "movies":
+            pass  # fall through to refresh
+        elif shows_changed and collection_type == "tvshows":
+            pass  # fall through to refresh
+        else:
+            continue
+        try:
+            r = requests.post(
+                f"{JELLYFIN_URL}/Items/{item_id}/Refresh",
+                headers=headers,
+                params={"Recursive": "true", "MetadataRefreshMode": "Default",
+                        "ImageRefreshMode": "Default", "ReplaceAllMetadata": "false",
+                        "ReplaceAllImages": "false"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            refreshed.append(name)
+        except Exception as e:
+            log.warning(f"Failed to refresh Jellyfin library '{name}': {e}")
+
+    if refreshed:
+        log.info(f"  Jellyfin refresh triggered: {', '.join(refreshed)}")
+
+
+# ---------------------------------------------------------------------------
+# Webhook server
+# ---------------------------------------------------------------------------
+
+# Event used to wake the scan loop early (set by webhook handler)
+_scan_event = threading.Event()
+
+
+class _WebhookHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler — POST /trigger wakes the scan loop."""
+
+    def do_POST(self):
+        if self.path.rstrip("/") == "/trigger":
+            _scan_event.set()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"triggered"}\n')
+            log.info("Webhook trigger received — waking scan loop")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_GET(self):
+        if self.path.rstrip("/") == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}\n')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):  # noqa: A002
+        """Suppress default stderr logging — we use our own logger."""
+        pass
+
+
+def _start_webhook_server():
+    """Start the webhook HTTP server in a daemon thread."""
+    server = HTTPServer(("", WEBHOOK_PORT), _WebhookHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info(f"Webhook server listening on port {WEBHOOK_PORT}")
 
 
 # ---------------------------------------------------------------------------
@@ -1673,7 +1804,11 @@ def run_scan():
 
     # Phase D — Build symlinks
     log.info("Phase D: Building symlinks...")
-    phase_d_build_symlinks()
+    changes = phase_d_build_symlinks()
+
+    # Trigger Jellyfin library refresh for any changed libraries
+    if changes:
+        _trigger_jellyfin_refresh(changes["films_changed"], changes["shows_changed"])
 
     # Summary
     all_torrents = pb.list_all_torrents()
@@ -1711,6 +1846,8 @@ def main():
     log.info(f"  TMDb API:       {'enabled' if TMDB_API_KEY else 'disabled (set TMDB_API_KEY)'}")
     log.info(f"  PocketBase:     {POCKETBASE_URL}")
     log.info(f"  Scan interval:  {SCAN_INTERVAL}s")
+    log.info(f"  Jellyfin:       {'enabled' if JELLYFIN_API_KEY else 'disabled (set JELLYFIN_API_KEY)'}")
+    log.info(f"  Webhook port:   {WEBHOOK_PORT}")
 
     # Initialise RD client for auto-repair
     if REAL_DEBRID_API_KEY and REPAIR_ENABLED:
@@ -1744,13 +1881,19 @@ def main():
     else:
         log.warning("Zurg mount not detected after 5 minutes, starting anyway")
 
+    # Start webhook server (receives triggers from Zurg)
+    _start_webhook_server()
+
     # Initial scan
     run_scan()
 
-    # Continuous monitoring loop
+    # Continuous monitoring loop — interruptible by webhook trigger
     while True:
-        log.info(f"Next scan in {SCAN_INTERVAL}s...")
-        time.sleep(SCAN_INTERVAL)
+        log.info(f"Next scan in {SCAN_INTERVAL}s (or on webhook trigger)...")
+        triggered = _scan_event.wait(timeout=SCAN_INTERVAL)
+        _scan_event.clear()
+        if triggered:
+            log.info("Scan triggered by webhook")
         try:
             run_scan()
         except Exception as e:
