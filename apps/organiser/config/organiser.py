@@ -761,9 +761,10 @@ def _score_tmdb_result(query_title: str, result: dict,
     name_words = _words(name)
     orig_words = _words(original_name)
 
-    # Best word overlap ratio (Jaccard-ish: intersection / query size)
-    overlap_name = len(query_words & name_words) / len(query_words) if query_words else 0
-    overlap_orig = len(query_words & orig_words) / len(query_words) if query_words else 0
+    # Jaccard similarity — penalises results with extra words in the name
+    # so that e.g. "Shogun" (exact) scores 1.0 but "Abarenbo Shogun" only 0.5.
+    overlap_name = len(query_words & name_words) / len(query_words | name_words) if query_words else 0
+    overlap_orig = len(query_words & orig_words) / len(query_words | orig_words) if query_words else 0
     title_score = max(overlap_name, overlap_orig)
 
     # Year proximity bonus / penalty.
@@ -791,16 +792,36 @@ def _score_tmdb_result(query_title: str, result: dict,
             except ValueError:
                 pass
 
-    # Slight popularity tiebreaker (normalised, max 0.05)
+    # Recency bias — when no year is provided in the torrent name, gently
+    # prefer shows that aired recently.  This helps when two results have
+    # similar title scores but very different air dates (e.g. a 2024 show
+    # vs a 1978 show for a bare "Shogun" query).
+    recency_bonus = 0.0
+    if not query_year:
+        air_date = result.get(date_key, "")
+        if air_date and len(air_date) >= 4:
+            try:
+                result_year = int(air_date[:4])
+                years_ago = datetime.date.today().year - result_year
+                if years_ago <= 2:
+                    recency_bonus = 0.06
+                elif years_ago <= 5:
+                    recency_bonus = 0.04
+                elif years_ago <= 10:
+                    recency_bonus = 0.02
+            except ValueError:
+                pass
+
+    # Popularity tiebreaker (normalised, max 0.10)
     popularity = result.get("popularity", 0)
-    pop_score = min(popularity / 1000, 0.05)
+    pop_score = min(popularity / 500, 0.10)
 
     # TMDB search-rank bonus — preserves TMDB's own relevance ordering as
     # a tiebreaker.  Decays with position so only the top few results get
     # a meaningful boost (max 0.04 for rank 0, 0 at rank 20+).
     rank_bonus = max(0.0, 0.04 - search_rank * 0.002)
 
-    return title_score + year_score + pop_score + rank_bonus
+    return title_score + year_score + recency_bonus + pop_score + rank_bonus
 
 
 def tmdb_search_tv(title: str, year: int | None = None,
