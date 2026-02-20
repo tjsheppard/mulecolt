@@ -50,6 +50,7 @@ from guessit import guessit
 from constants import (
     CLEANUP_ARCHIVED,
     FILMS_DIR,
+    JELLYFIN_API_KEY,
     JELLYFIN_ZURG_PATH,
     MAX_REPAIR_ATTEMPTS,
     MEDIA_DIR,
